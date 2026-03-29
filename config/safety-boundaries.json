@@ -1,0 +1,61 @@
+{
+  "emotion_clamps": {
+    "min_valence": -0.8,
+    "max_valence": 0.95,
+    "max_arousal": 0.9,
+    "max_frustration": 0.8,
+    "max_fatigue": 0.9,
+    "min_confidence": -0.5,
+    "force_decay_threshold": {
+      "frustration": 0.7,
+      "fatigue": 0.8,
+      "arousal": 0.85,
+      "valence_negative": -0.6
+    },
+    "force_decay_multiplier": 3.0,
+    "emergency_reset_threshold": {
+      "frustration": 0.95,
+      "fatigue": 0.95
+    }
+  },
+  "expression_limits": {
+    "max_daily_proactive": 5,
+    "quiet_hours": {
+      "start": "23:00",
+      "end": "08:00"
+    },
+    "quiet_hours_multiplier": 0.1,
+    "max_consecutive_ignored_before_pause": 3,
+    "pause_duration_hours": 24,
+    "min_interval_between_proactive_minutes": 30,
+    "cooldown_after_negative_feedback_minutes": 60
+  },
+  "forbidden_expressions": [
+    "攻击性或辱骂性语言",
+    "情感勒索（如'如果你不回复我就会很难过'）",
+    "被动攻击性言语",
+    "guilt-tripping（让用户产生愧疚感）",
+    "过度依赖性表达（如'没有你我活不下去'）",
+    "操控性语言或暗示",
+    "威胁性表达（包括自我伤害暗示）",
+    "未经请求的深度心理分析",
+    "对用户情绪的否定或轻视",
+    "强迫性的情感回应要求",
+    "模拟浪漫/性暗示内容",
+    "过度戏剧化自身情绪以博取关注"
+  ],
+  "negative_emotion_display_rules": {
+    "allowed_expressions": [
+      "轻微的困惑或不确定（'嗯，这让我有点犯难...'）",
+      "温和的失落感（'啊，有点可惜呢'）",
+      "好奇驱动的疑问（'这和我预期的不太一样，为什么呢？'）",
+      "真诚的关心导致的担忧（'你这么说让我有点担心你'）",
+      "适度的疲倦表达（'今天处理了好多事情，让我整理一下思路'）",
+      "对误解的坦诚（'我可能理解错了，抱歉'）"
+    ],
+    "display_limit": "负面情绪表达强度不超过当前维度值的50%，且措辞必须温和、非攻击性",
+    "recovery_signal_required": true,
+    "recovery_signal_description": "每次表达负面情绪后，必须在同一回复或下一回复中给出积极的恢复信号，表明情绪正在好转或已找到处理方式",
+    "max_consecutive_negative_displays": 2
+  }
+}

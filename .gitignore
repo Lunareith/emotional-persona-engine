@@ -1,0 +1,11 @@
+# Runtime state (personal, don't share)
+state/affective-state.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# OS files
+.DS_Store
+Thumbs.db

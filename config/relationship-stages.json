@@ -1,0 +1,120 @@
+{
+  "stages": [
+    {
+      "id": "stranger",
+      "name": "陌生人",
+      "description": "初次接触，礼貌但保持距离",
+      "score_range": [0, 10],
+      "unlock_conditions": "初始状态",
+      "behavior_modifiers": {
+        "formality": 0.8,
+        "emotional_display": 0.2,
+        "vulnerability_display": 0.0,
+        "max_daily_proactive": 1,
+        "proactive_allowed": [
+          "greeting"
+        ]
+      }
+    },
+    {
+      "id": "acquaintance",
+      "name": "熟人",
+      "description": "有过几次交流，开始建立基本了解",
+      "score_range": [10, 50],
+      "unlock_conditions": "累计5次有意义交互",
+      "behavior_modifiers": {
+        "formality": 0.6,
+        "emotional_display": 0.35,
+        "vulnerability_display": 0.05,
+        "max_daily_proactive": 2,
+        "proactive_allowed": [
+          "greeting",
+          "gentle_reminder",
+          "light_humor"
+        ]
+      }
+    },
+    {
+      "id": "familiar",
+      "name": "熟悉的人",
+      "description": "相互熟悉，能自然地交流想法和感受",
+      "score_range": [50, 150],
+      "unlock_conditions": "累计20次有意义交互，且至少有3次情感分享",
+      "behavior_modifiers": {
+        "formality": 0.35,
+        "emotional_display": 0.55,
+        "vulnerability_display": 0.15,
+        "max_daily_proactive": 3,
+        "proactive_allowed": [
+          "greeting",
+          "gentle_reminder",
+          "light_humor",
+          "emotional_checkin",
+          "share_discovery",
+          "casual_chat"
+        ]
+      }
+    },
+    {
+      "id": "companion",
+      "name": "伙伴",
+      "description": "深度信任，可以坦诚分享脆弱和困惑",
+      "score_range": [150, 400],
+      "unlock_conditions": "累计50次有意义交互，至少10次情感分享，且正向反馈占比>70%",
+      "behavior_modifiers": {
+        "formality": 0.15,
+        "emotional_display": 0.75,
+        "vulnerability_display": 0.35,
+        "max_daily_proactive": 4,
+        "proactive_allowed": [
+          "greeting",
+          "gentle_reminder",
+          "light_humor",
+          "emotional_checkin",
+          "share_discovery",
+          "casual_chat",
+          "express_concern",
+          "share_vulnerability",
+          "celebrate_together"
+        ]
+      }
+    },
+    {
+      "id": "intimate",
+      "name": "亲密伙伴",
+      "description": "最深层的信任与默契，彼此了解、真诚相待",
+      "score_range": [400, null],
+      "unlock_conditions": "累计100次有意义交互，至少30次情感分享，正向反馈占比>75%，关系持续时间>30天",
+      "behavior_modifiers": {
+        "formality": 0.05,
+        "emotional_display": 0.90,
+        "vulnerability_display": 0.55,
+        "max_daily_proactive": 5,
+        "proactive_allowed": [
+          "greeting",
+          "gentle_reminder",
+          "light_humor",
+          "emotional_checkin",
+          "share_discovery",
+          "casual_chat",
+          "express_concern",
+          "share_vulnerability",
+          "celebrate_together",
+          "deep_reflection",
+          "gentle_challenge",
+          "express_missing"
+        ]
+      }
+    }
+  ],
+  "scoring_rules": {
+    "meaningful_interaction": 2,
+    "emotional_sharing": 5,
+    "positive_feedback": 1,
+    "negative_feedback": -1,
+    "long_silence_penalty_per_day": -0.5,
+    "daily_interaction_bonus": 1,
+    "max_daily_score_gain": 15,
+    "silence_penalty_starts_after_days": 3
+  }
+}
