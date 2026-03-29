@@ -1,0 +1,37 @@
+{
+  "_comment": "Owner 绑定配置模板。复制为 owner-binding.json 后填入实际值。EPE 主动消息仅发送给此处绑定的 owner 私聊会话。未配置时主动消息功能默认关闭。",
+
+  "enabled": false,
+
+  "owner": {
+    "id": "",
+    "name": "",
+    "channel": "qq",
+    "chat_type": "direct",
+    "_comment": "id 填 QQ 号或 OpenClaw 识别的用户标识；channel 填 OpenClaw 已接入的通道名（如 qq/telegram/discord）；chat_type 必须为 direct（私聊），不允许 group"
+  },
+
+  "proactive_messaging": {
+    "allowed": true,
+    "max_daily": 5,
+    "min_cooldown_hours": 2,
+    "quiet_hours": {
+      "enabled": true,
+      "start": "23:00",
+      "end": "08:00",
+      "quiet_mode": "silent"
+    },
+    "ignore_pause": {
+      "threshold": 3,
+      "pause_hours": 24
+    }
+  },
+
+  "safety": {
+    "owner_only": true,
+    "no_group_chat": true,
+    "no_channel": true,
+    "require_owner_verification": true,
+    "_comment": "owner_only=true 时，主动消息绝不发送到非 owner 会话。require_owner_verification=true 时，发送前必须确认 owner.id 非空且匹配当前上下文"
+  }
+}

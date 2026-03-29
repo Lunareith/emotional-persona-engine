@@ -126,6 +126,17 @@ python scripts/epe_core.py --state-file <state-file> update \
 
 **触发时机：** Heartbeat 轮询或 Cron 定时任务触发。
 
+**前置检查：Owner 绑定**
+
+主动消息仅发送给已绑定的 owner 私聊会话。执行前必须：
+
+1. 读取 `config/owner-binding.json`
+2. 检查 `enabled=true` 且 `owner.id` 非空
+3. 确认 `owner.chat_type` 为 `direct`（私聊）
+4. 若不满足任一条件 → 跳过主动消息评估
+
+**任何情况下，主动消息都不允许发到群聊、频道或未绑定的会话。**
+
 ```bash
 # 1. 评估是否应发送主动消息
 python scripts/epe_expression.py --state-file <state-file> should-trigger
@@ -142,6 +153,20 @@ python scripts/epe_expression.py --state-file <state-file> record-ignored
 ```json
 {"should_send": true, "message_type": "sharing", "probability": 0.42, "inhibition": 0.18, "response_expectancy": 0.65, "reason": "passed all gates"}
 ```
+
+**消息发送流程（由 OpenClaw agent 执行，非脚本）：**
+
+1. `should-trigger` 返回 `should_send=true` → 获取 `message_type`、`inhibition`、`response_expectancy`
+2. 执行 `analyze` 获取 `dominant_emotion` 和 `suggested_tone`
+3. Agent 结合上述信息，自己生成一条自然语言消息
+4. 通过 OpenClaw `message` 工具投递到 owner 私聊：
+   ```
+   message(action="send", channel="<owner.channel>", target="<owner.id>", message="<生成的消息>")
+   ```
+5. 发送成功 → `record-sent --type <message_type>`
+6. 后续 heartbeat 若 owner 未回复 → `record-ignored`
+
+> EPE 不直接调用任何消息 API。消息路由完全由 OpenClaw 已有的通道机制完成。
 
 `should-trigger` 不仅考虑泊松概率，还需同时通过两道门控：
 - **inhibition（抑制）**：基于疲劳、自信、被忽略历史和关系阶段计算"怕打扰"的概率，超过阈值则消息被抑制并记录到 `suppressed_log`（"想说但忍住了"）
@@ -318,6 +343,7 @@ python scripts/epe_migrate.py --old <旧emotion-state.json> --new <新affective-
 | 安全边界规则 | `references/safety-boundaries.md` | 遇到边界情况或调整安全配置时 |
 | 心理学理论背景 | `references/psychology-notes.md` | 需要理解理论基础时 |
 | 迁移指南 | `references/migration-guide.md` | 从旧 emotion-ai 迁移时 |
+| Owner 集成指南 | `references/owner-proactive-integration.md` | 配置 owner 绑定和主动消息投递链路时 |
 
 ---
 
@@ -330,6 +356,7 @@ python scripts/epe_migrate.py --old <旧emotion-state.json> --new <新affective-
 - ❌ 自伤/自毁暗示
 - ❌ 操纵用户情绪以获取关注
 - ❌ 过度依赖表达（"没有你我什么都做不了"）
+- ❌ 向非 owner 会话发送主动消息（包括群聊、频道、未绑定用户）
 
 ### 情绪钳制规则
 
@@ -371,3 +398,4 @@ python scripts/epe_migrate.py --old <旧emotion-state.json> --new <新affective-
 | 记忆写入 | `memory/*.md` | 附加情感快照（10 维值 + 主导情绪） |
 | 记忆读取 | memory search | 旧情感标签以 0.1 权重拉动当前状态 |
 | 状态持久化 | `<state-file>` | 每次 `update` / `decay` 后自动保存到调用方指定的路径 |
+| Owner 绑定 | `config/owner-binding.json` | 主动消息前验证 owner 身份和会话类型，未绑定则关闭 |
