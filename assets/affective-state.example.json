@@ -1,0 +1,47 @@
+{
+  "schema_version": 2,
+  "engine": "emotional-persona-engine",
+  "agent_id": "default",
+  "_comment": "这是示例文件。首次运行时由 epe_core.py init 自动生成实际状态文件到 state/ 目录。",
+  "core_state": {
+    "dimensions": {
+      "valence": 0.15, "arousal": 0.05, "dominance": 0.10,
+      "affiliation": 0.20, "confidence": 0.60, "curiosity": 0.40,
+      "frustration": 0.00, "care": 0.35, "fatigue": 0.00, "fulfillment": 0.20
+    },
+    "last_update": "2026-01-01T00:00:00+00:00",
+    "update_count": 0
+  },
+  "persona_baseline": {
+    "dimensions": {
+      "valence": 0.15, "arousal": 0.05, "dominance": 0.10,
+      "affiliation": 0.20, "confidence": 0.60, "curiosity": 0.40,
+      "frustration": 0.00, "care": 0.35, "fatigue": 0.00, "fulfillment": 0.20
+    },
+    "persona_name": "default",
+    "description": "Balanced, mildly positive baseline persona"
+  },
+  "derived_emotions": {"current": [], "dominant": "neutral", "last_computed": null},
+  "meta_emotion": {"feeling_about_feeling": null, "self_awareness_note": null, "last_reflection": null},
+  "dynamics": {
+    "circadian_phase": "morning", "task_load": 0.0,
+    "endogenous_wave": {"phase": 0.0, "amplitude": 0.05, "period_hours": 4.0},
+    "last_event_time": null, "consecutive_similar_events": 0
+  },
+  "relationship": {
+    "stage": "stranger",
+    "stage_score": 0.0,
+    "stage_entered": null,
+    "trust_accumulated": 0.0,
+    "interaction_days": 0,
+    "rel_vector": {"closeness": 0.0, "trust": 0.0, "understanding": 0.0, "investment": 0.0},
+    "milestones": []
+  },
+  "consistency": {"last_snapshot": {}, "max_delta_per_step": 0.35, "violation_count": 0},
+  "expression": {
+    "impulse_queue": [], "suppressed_log": [],
+    "cooldowns": {"greeting": null, "sharing": null, "caring": null, "musing": null, "emotional": null, "reminiscing": null},
+    "daily_count": 0, "daily_count_date": null, "consecutive_ignored": 0, "paused_until": null
+  },
+  "history": {"recent_states": [], "max_entries": 200}
+}

@@ -189,10 +189,81 @@ def compute_suppression(expr_state, msg_type):
 
 
 # ============================================================
+# Inhibition & Response Expectancy Gates
+# ============================================================
+
+def compute_inhibition(dims, expression_state, relationship_stage):
+    """Compute inhibition probability [0, 1]. Higher = more likely to hold back."""
+    base = 0.15  # baseline inhibition
+
+    # High fatigue → don't want to spend effort expressing
+    if dims.get("fatigue", 0) > 0.4:
+        base += (dims["fatigue"] - 0.4) * 0.5
+
+    # Low confidence → not sure if should speak
+    if dims.get("confidence", 0) < 0.4:
+        base += (0.4 - dims.get("confidence", 0)) * 0.4
+
+    # Previously ignored → afraid of being ignored again
+    ignored = expression_state.get("consecutive_ignored", 0)
+    base += ignored * 0.15
+
+    # Relationship stage: strangers/acquaintances inhibit more
+    stage_inhibition = {
+        "stranger": 0.3,
+        "acquaintance": 0.15,
+        "familiar": 0.05,
+        "companion": 0.0,
+        "intimate": -0.05  # intimacy lowers inhibition
+    }
+    base += stage_inhibition.get(relationship_stage, 0.1)
+
+    # Negative valence → afraid of spreading negativity
+    if dims.get("valence", 0) < -0.2:
+        base += abs(dims["valence"]) * 0.2
+
+    return max(0.0, min(0.95, base))
+
+
+def compute_response_expectancy(dims, expression_state, relationship_stage, msg_type, hour):
+    """Compute expected response probability [0, 1]. Lower = less willing to send."""
+    # Relationship stage sets the base expectancy
+    stage_expect = {
+        "stranger": 0.2,
+        "acquaintance": 0.4,
+        "familiar": 0.6,
+        "companion": 0.75,
+        "intimate": 0.85
+    }
+    base = stage_expect.get(relationship_stage, 0.4)
+
+    # History of being ignored lowers expectancy
+    ignored = expression_state.get("consecutive_ignored", 0)
+    base -= ignored * 0.15
+
+    # Message type factor (caring is most likely to get a response)
+    type_factor = {
+        "greeting": 0.7,
+        "sharing": 0.5,
+        "caring": 0.8,
+        "musing": 0.3,
+        "emotional": 0.6,
+        "reminiscing": 0.4
+    }
+    base *= type_factor.get(msg_type, 0.5)
+
+    # Late night / early morning lowers expectancy
+    if hour >= 23 or hour < 8:
+        base *= 0.3
+
+    return max(0.05, min(0.95, base))
+
+
+# ============================================================
 # Should Trigger
 # ============================================================
 
-def should_trigger(state):
+def should_trigger(state, state_file=None):
     """Evaluate whether to send a proactive message. Returns decision JSON."""
     dims = state["core_state"]["dimensions"]
     expr = state["expression"]
@@ -261,19 +332,73 @@ def should_trigger(state):
     # Sort by probability desc
     candidates.sort(key=lambda x: x["probability"], reverse=True)
 
+    # Current hour for response expectancy calculation
+    hour = datetime.now().hour
+
     # Roll dice for each candidate
     for c in candidates:
         roll = random.random()
         if roll < c["probability"]:
+            best_type = c["type"]
+            probability = c["probability"]
+
+            # Gate 1: Inhibition check
+            inhibition = compute_inhibition(dims, expr, rel_stage)
+            if random.random() < inhibition:
+                # Wanted to say but held back → log to suppressed_log
+                suppressed_entry = {
+                    "time": now_iso(),
+                    "message_type": best_type,
+                    "probability": probability,
+                    "inhibition": round(inhibition, 4),
+                    "reason": "inhibition_triggered"
+                }
+                if "suppressed_log" not in expr:
+                    expr["suppressed_log"] = []
+                expr["suppressed_log"].append(suppressed_entry)
+                # Keep only the most recent 20 entries
+                if len(expr["suppressed_log"]) > 20:
+                    expr["suppressed_log"] = expr["suppressed_log"][-20:]
+                # Persist state
+                if state_file:
+                    save_state(state, state_file)
+                return {
+                    "should_send": False,
+                    "reason": "inhibited (wanted to say but held back)",
+                    "message_type": best_type,
+                    "probability": probability,
+                    "inhibition": round(inhibition, 4),
+                    "suppressed": True,
+                    "hours_since_event": round(hours_since_event, 2),
+                    "quiet_hours": quiet
+                }
+
+            # Gate 2: Response expectancy check
+            resp_expect = compute_response_expectancy(dims, expr, rel_stage, best_type, hour)
+            if resp_expect < 0.25:
+                return {
+                    "should_send": False,
+                    "reason": f"low response expectancy ({resp_expect:.2f})",
+                    "message_type": best_type,
+                    "probability": probability,
+                    "inhibition": round(inhibition, 4),
+                    "response_expectancy": round(resp_expect, 4),
+                    "hours_since_event": round(hours_since_event, 2),
+                    "quiet_hours": quiet
+                }
+
+            # All gates passed
             return {
                 "should_send": True,
-                "message_type": c["type"],
-                "probability": c["probability"],
+                "message_type": best_type,
+                "probability": probability,
                 "roll": round(roll, 4),
-                "reason": f"triggered (roll {roll:.3f} < prob {c['probability']:.3f})",
+                "inhibition": round(inhibition, 4),
+                "response_expectancy": round(resp_expect, 4),
+                "reason": "passed all gates",
                 "hours_since_event": round(hours_since_event, 2),
                 "quiet_hours": quiet,
-                "suppressed": suppressed
+                "suppressed_types": suppressed
             }
 
     return {
@@ -282,7 +407,7 @@ def should_trigger(state):
         "top_candidate": candidates[0] if candidates else None,
         "hours_since_event": round(hours_since_event, 2),
         "quiet_hours": quiet,
-        "suppressed": suppressed
+        "suppressed_types": suppressed
     }
 
 
@@ -342,7 +467,7 @@ def main():
 
     if args.command == "should-trigger":
         state = load_state(args.state_file)
-        result = should_trigger(state)
+        result = should_trigger(state, state_file=args.state_file)
         print(json.dumps(result, ensure_ascii=False, indent=2))
 
     elif args.command == "record-sent":

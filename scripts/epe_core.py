@@ -217,12 +217,18 @@ def create_initial_state(persona_name="default"):
             "consecutive_similar_events": 0
         },
         "relationship": {
-            "stage": "acquaintance",
+            "stage": "stranger",
             "stage_score": 0.0,
             "stage_entered": ts,
             "trust_accumulated": 0.0,
             "interaction_days": 0,
-            "milestones": []
+            "milestones": [],
+            "rel_vector": {
+                "closeness": 0.0,
+                "trust": 0.0,
+                "understanding": 0.0,
+                "investment": 0.0
+            }
         },
         "consistency": {
             "last_snapshot": {},
@@ -258,6 +264,7 @@ def apply_decay(state):
     last_update = parse_iso(state["core_state"]["last_update"])
     now_dt = datetime.now(timezone.utc)
     elapsed_minutes = max(0, (now_dt - last_update).total_seconds() / 60.0)
+    hours_elapsed = elapsed_minutes / 60.0
 
     if elapsed_minutes < 0.01:
         return state
@@ -299,6 +306,15 @@ def apply_decay(state):
     # Clamp
     for dim in DIMENSIONS:
         dims[dim] = clamp(dims[dim], dim)
+
+    # 关系衰减（长时间不互动）
+    rel = state.get("relationship", {})
+    rv = rel.get("rel_vector", {})
+    if rv and hours_elapsed > 48:
+        decay_factor = min(0.01, (hours_elapsed - 48) * 0.0001)
+        rv["closeness"] = max(0, rv["closeness"] - decay_factor)
+        rel["rel_vector"] = rv
+        state["relationship"] = rel
 
     state["core_state"]["last_update"] = now_iso()
     return state
@@ -464,37 +480,103 @@ def update_meta_emotion(state, derived):
 # Relationship Stage
 # ============================================================
 
-RELATIONSHIP_STAGES = ["acquaintance", "familiar", "companion", "close_friend", "intimate"]
-STAGE_THRESHOLDS = [0.0, 10.0, 30.0, 70.0, 150.0]
+RELATIONSHIP_STAGES = ["stranger", "acquaintance", "familiar", "companion", "intimate"]
+
+# 4-dimensional continuous relationship vector
+RELATIONSHIP_DIMS = {
+    "closeness": (0, 1),      # 亲密度：互动频率和深度积累
+    "trust": (0, 1),          # 信任度：承诺兑现、隐私尊重
+    "understanding": (0, 1),  # 理解度：对彼此偏好/习惯的了解
+    "investment": (0, 1)      # 投入度：双方在关系中的情感投资
+}
+
+
+def derive_relationship_stage(rel_vector):
+    """从连续向量派生阶段标签"""
+    avg = sum(rel_vector.values()) / len(rel_vector)
+    min_val = min(rel_vector.values())
+
+    # 阶段要求所有维度都达到一定水平（不能偏科）
+    if avg >= 0.8 and min_val >= 0.6:
+        return "intimate"
+    elif avg >= 0.6 and min_val >= 0.4:
+        return "companion"
+    elif avg >= 0.4 and min_val >= 0.2:
+        return "familiar"
+    elif avg >= 0.2:
+        return "acquaintance"
+    else:
+        return "stranger"
 
 
 def update_relationship(state, trigger=None):
     rel = state["relationship"]
     dims = state["core_state"]["dimensions"]
 
-    base_score = 0.5
-    affection_bonus = max(0, dims["affiliation"]) * 0.3
-    care_bonus = max(0, dims["care"]) * 0.2
-    valence_bonus = max(0, dims["valence"]) * 0.2
-    increment = base_score + affection_bonus + care_bonus + valence_bonus
+    # 确保 rel_vector 存在（兼容旧状态）
+    if "rel_vector" not in rel:
+        # 从旧 stage_score 迁移
+        old_score = rel.get("stage_score", 0) / 100.0  # normalize to [0,1]
+        rel["rel_vector"] = {
+            "closeness": min(1.0, old_score * 1.2),
+            "trust": min(1.0, old_score * 0.8),
+            "understanding": min(1.0, old_score * 0.6),
+            "investment": min(1.0, old_score * 0.5)
+        }
 
-    rel["stage_score"] += increment
-    rel["trust_accumulated"] += increment * 0.5
-    rel["interaction_days"] = max(rel.get("interaction_days", 0), 1)
+    rv = rel["rel_vector"]
 
-    current_idx = RELATIONSHIP_STAGES.index(rel["stage"]) if rel["stage"] in RELATIONSHIP_STAGES else 0
-    for i in range(len(RELATIONSHIP_STAGES) - 1, current_idx, -1):
-        if rel["stage_score"] >= STAGE_THRESHOLDS[i]:
-            if RELATIONSHIP_STAGES[i] != rel["stage"]:
-                rel["stage"] = RELATIONSHIP_STAGES[i]
-                rel["stage_entered"] = now_iso()
-                rel["milestones"].append({
-                    "stage": RELATIONSHIP_STAGES[i],
-                    "time": now_iso(),
-                    "score": rel["stage_score"]
-                })
-            break
+    # 每次交互都微增 closeness
+    rv["closeness"] = min(1.0, rv["closeness"] + 0.005)
 
+    # 正面互动增加 trust
+    if dims["valence"] > 0.2:
+        rv["trust"] = min(1.0, rv["trust"] + 0.003)
+
+    # 持续交互增加 understanding
+    rv["understanding"] = min(1.0, rv["understanding"] + 0.002)
+
+    # 情感深度增加 investment
+    emotional_depth = abs(dims["valence"]) + dims["care"] + dims["affiliation"]
+    if emotional_depth > 0.5:
+        rv["investment"] = min(1.0, rv["investment"] + emotional_depth * 0.005)
+
+    # 负面事件可以降低维度（关系不是单调递增的！）
+    if dims["frustration"] > 0.5:
+        rv["trust"] = max(0, rv["trust"] - 0.005)
+    if dims["valence"] < -0.3:
+        rv["investment"] = max(0, rv["investment"] - 0.002)
+
+    # 长时间不互动 → closeness 缓慢衰减
+    # （这个由 last_event_time 判断，在 decay 阶段处理）
+
+    # 更新 stage_score（保持向后兼容）
+    avg = sum(rv.values()) / len(rv)
+    rel["stage_score"] = round(avg * 100, 1)
+
+    # 更新 trust_accumulated（保持向后兼容）
+    rel["trust_accumulated"] = round(rv["trust"] * 100, 1)
+
+    # 派生阶段标签
+    new_stage = derive_relationship_stage(rv)
+    old_stage = rel.get("stage", "stranger")
+
+    if new_stage != old_stage:
+        rel["stage_entered"] = now_iso()
+        rel["milestones"].append({
+            "from_stage": old_stage,
+            "to_stage": new_stage,
+            "time": now_iso(),
+            "score": rel["stage_score"],
+            "rel_vector": rv.copy(),
+            "note": f"triggered by: {trigger}" if trigger else None
+        })
+
+    rel["stage"] = new_stage
+    rel["rel_vector"] = rv
+    rel["interaction_days"] = rel.get("interaction_days", 0)  # 保持不变，由外部计算
+
+    state["relationship"] = rel
     return state
 
 
@@ -652,7 +734,8 @@ def cmd_update(args):
         "derived_emotions": derived[:5],
         "dominant_emotion": state["derived_emotions"]["dominant"],
         "meta_emotion": state["meta_emotion"]["feeling_about_feeling"],
-        "relationship_stage": state["relationship"]["stage"]
+        "relationship_stage": state["relationship"]["stage"],
+        "rel_vector": state["relationship"].get("rel_vector", {})
     }
     print(json.dumps(output, ensure_ascii=False, indent=2))
 
@@ -660,13 +743,15 @@ def cmd_update(args):
 def cmd_get(args):
     state = load_state(args.state_file)
     dims = state["core_state"]["dimensions"]
+    rel = state["relationship"]
     output = {
         "dimensions": {d: round(dims[d], 4) for d in DIMENSIONS},
         "last_update": state["core_state"]["last_update"],
         "update_count": state["core_state"]["update_count"],
         "derived_emotions": state["derived_emotions"],
         "meta_emotion": state["meta_emotion"],
-        "relationship": state["relationship"],
+        "relationship": rel,
+        "rel_vector": rel.get("rel_vector", {}),
         "circadian_phase": state["dynamics"]["circadian_phase"],
         "persona": state["persona_baseline"]["persona_name"]
     }
@@ -756,7 +841,8 @@ def cmd_analyze(args):
         "trend": trend,
         "active_emotions": [{"emotion": e["emotion"], "intensity": e["intensity"]} for e in derived if e["intensity"] > 0.15],
         "dimensions_summary": {d: round(dims[d], 4) for d in DIMENSIONS},
-        "relationship_stage": state["relationship"]["stage"]
+        "relationship_stage": state["relationship"]["stage"],
+        "rel_vector": state["relationship"].get("rel_vector", {})
     }
     print(json.dumps(output, ensure_ascii=False, indent=2))
 

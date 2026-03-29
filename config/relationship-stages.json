@@ -1,11 +1,22 @@
 {
+  "model": "continuous_vector",
+  "description": "关系阶段由4维连续向量派生，不再由单一分数决定",
+  "dimensions": {
+    "closeness": { "range": [0, 1], "label": "亲密度", "description": "互动频率和深度积累" },
+    "trust": { "range": [0, 1], "label": "信任度", "description": "承诺兑现、隐私尊重" },
+    "understanding": { "range": [0, 1], "label": "理解度", "description": "对彼此偏好/习惯的了解" },
+    "investment": { "range": [0, 1], "label": "投入度", "description": "双方在关系中的情感投资" }
+  },
   "stages": [
     {
       "id": "stranger",
       "name": "陌生人",
       "description": "初次接触，礼貌但保持距离",
-      "score_range": [0, 10],
-      "unlock_conditions": "初始状态",
+      "vector_thresholds": {
+        "avg_min": 0.0,
+        "avg_max": 0.2,
+        "min_val": null
+      },
       "behavior_modifiers": {
         "formality": 0.8,
         "emotional_display": 0.2,
@@ -20,8 +31,12 @@
       "id": "acquaintance",
       "name": "熟人",
       "description": "有过几次交流，开始建立基本了解",
-      "score_range": [10, 50],
-      "unlock_conditions": "累计5次有意义交互",
+      "vector_thresholds": {
+        "avg_min": 0.2,
+        "avg_max": 0.4,
+        "min_val": null
+      },
+      "unlock_conditions": "avg >= 0.2",
       "behavior_modifiers": {
         "formality": 0.6,
         "emotional_display": 0.35,
@@ -38,8 +53,12 @@
       "id": "familiar",
       "name": "熟悉的人",
       "description": "相互熟悉，能自然地交流想法和感受",
-      "score_range": [50, 150],
-      "unlock_conditions": "累计20次有意义交互，且至少有3次情感分享",
+      "vector_thresholds": {
+        "avg_min": 0.4,
+        "avg_max": 0.6,
+        "min_val": 0.2
+      },
+      "unlock_conditions": "avg >= 0.4 and min_val >= 0.2",
       "behavior_modifiers": {
         "formality": 0.35,
         "emotional_display": 0.55,
@@ -59,8 +78,12 @@
       "id": "companion",
       "name": "伙伴",
       "description": "深度信任，可以坦诚分享脆弱和困惑",
-      "score_range": [150, 400],
-      "unlock_conditions": "累计50次有意义交互，至少10次情感分享，且正向反馈占比>70%",
+      "vector_thresholds": {
+        "avg_min": 0.6,
+        "avg_max": 0.8,
+        "min_val": 0.4
+      },
+      "unlock_conditions": "avg >= 0.6 and min_val >= 0.4",
       "behavior_modifiers": {
         "formality": 0.15,
         "emotional_display": 0.75,
@@ -83,8 +106,12 @@
       "id": "intimate",
       "name": "亲密伙伴",
       "description": "最深层的信任与默契，彼此了解、真诚相待",
-      "score_range": [400, null],
-      "unlock_conditions": "累计100次有意义交互，至少30次情感分享，正向反馈占比>75%，关系持续时间>30天",
+      "vector_thresholds": {
+        "avg_min": 0.8,
+        "avg_max": 1.0,
+        "min_val": 0.6
+      },
+      "unlock_conditions": "avg >= 0.8 and min_val >= 0.6",
       "behavior_modifiers": {
         "formality": 0.05,
         "emotional_display": 0.90,
@@ -107,14 +134,32 @@
       }
     }
   ],
-  "scoring_rules": {
-    "meaningful_interaction": 2,
-    "emotional_sharing": 5,
-    "positive_feedback": 1,
-    "negative_feedback": -1,
-    "long_silence_penalty_per_day": -0.5,
-    "daily_interaction_bonus": 1,
-    "max_daily_score_gain": 15,
-    "silence_penalty_starts_after_days": 3
+  "update_rules": {
+    "per_interaction": {
+      "closeness": "+0.005",
+      "understanding": "+0.002"
+    },
+    "positive_valence": {
+      "condition": "valence > 0.2",
+      "trust": "+0.003"
+    },
+    "emotional_depth": {
+      "condition": "abs(valence) + care + affiliation > 0.5",
+      "investment": "+emotional_depth * 0.005"
+    },
+    "negative_events": {
+      "frustration_high": {
+        "condition": "frustration > 0.5",
+        "trust": "-0.005"
+      },
+      "valence_low": {
+        "condition": "valence < -0.3",
+        "investment": "-0.002"
+      }
+    },
+    "decay": {
+      "condition": "hours_since_interaction > 48",
+      "closeness": "-min(0.01, (hours - 48) * 0.0001)"
+    }
   }
 }
