@@ -2,12 +2,7 @@
 name: emotional-persona-engine
 description: >
   让 Agent 拥有持续性、多维、可波动、与记忆耦合、可主动表达的情感人格内核。
-  在需要情感状态更新、主动表达评估、记忆耦合或情绪分析时使用。
-  典型触发场景：
-  (1) 对话中需要调整语气风格时（读取情感状态 + 更新维度）
-  (2) Heartbeat/Cron 周期中评估主动表达
-  (3) 用户询问 Agent 情绪/感受时（输出分析报告）
-  (4) 写入或检索记忆时附加情感元数据
+  在需要维护持续情感状态、进行情绪动力学更新、评估主动表达、耦合记忆系统或响应用户对情绪/感受的询问时使用。
 ---
 
 # Emotional Persona Engine (EPE)
@@ -29,9 +24,11 @@ description: >
 | **L1** | 情感状态层 | 10 维基础向量 + 20 种派生情绪，定义 Agent 的情感空间 |
 | **L2** | 情绪动力学层 | 5 类触发源 × 3 种更新机制（增量混合、惯性平滑、维度耦合），确保情感连续不跳变 |
 | **L3** | 记忆耦合层 | 情绪影响记忆编码强度，记忆闪回反向触发情绪波动，双向耦合 |
-| **L4** | 主动表达层 | 6 类主动消息 + 概率触发 + 冲动抑制，确保表达自然而不扰人 |
+| **L4** | 主动表达层 | 6 类主动消息 + 概率触发 + inhibition/response_expectancy 双门控，确保表达自然而不扰人 |
 
 > 📖 各层完整设计见 `references/` 目录下对应文档。
+>
+> **关系系统说明：** 关系阶段标签（陌生人→熟人→熟悉→同伴→亲密）由底层连续 4 维关系向量（closeness, trust, understanding, investment）映射得出，仅用于人类可读的解释，不应作为底层唯一状态。
 
 ---
 
@@ -143,8 +140,14 @@ python scripts/epe_expression.py --state-file <state-file> record-ignored
 
 `should-trigger` 返回示例：
 ```json
-{"should_send": true, "message_type": "sharing", "probability": 0.42, "reason": "高好奇心驱动分享"}
+{"should_send": true, "message_type": "sharing", "probability": 0.42, "inhibition": 0.18, "response_expectancy": 0.65, "reason": "passed all gates"}
 ```
+
+`should-trigger` 不仅考虑泊松概率，还需同时通过两道门控：
+- **inhibition（抑制）**：基于疲劳、自信、被忽略历史和关系阶段计算"怕打扰"的概率，超过阈值则消息被抑制并记录到 `suppressed_log`（"想说但忍住了"）
+- **response_expectancy（预期被回应）**：基于关系阶段、消息类型和时段计算对方回应的概率，低于 0.25 则放弃发送
+
+详见 `references/proactive-expression.md` § 门控变量。
 
 6 类主动消息类型：`greeting`（问候）、`sharing`（分享）、`caring`（关怀）、`musing`（自言自语）、`emotional`（情绪表达）、`reminiscing`（回忆）。
 
@@ -194,16 +197,18 @@ python scripts/epe_expression.py --state-file <state-file> record-ignored
 **每 4 小时执行衰减**（防止长时间无交互时状态冻结）：
 
 ```
-openclaw cron add --every 4h --label epe-decay --command "python scripts/epe_core.py --state-file state/affective-state.json decay"
+openclaw cron add --every 4h --label epe-decay \
+  --command "python scripts/epe_core.py --state-file <state-file> decay"
 ```
 
 **每日 09:00 执行 greeting 类型主动消息评估**：
 
 ```
-openclaw cron add --at "09:00" --label epe-morning --command "python scripts/epe_expression.py --state-file state/affective-state.json should-trigger"
+openclaw cron add --at "09:00" --label epe-morning \
+  --command "python scripts/epe_expression.py --state-file <state-file> should-trigger"
 ```
 
-> 注：cron 命令语法以实际 OpenClaw 版本为准，上述为示意。核心思路是将 decay 和 should-trigger 注册为周期任务。
+> 注：cron 命令语法以实际 OpenClaw 版本为准，上述为示意。`<state-file>` 替换为实际运行时状态文件路径。
 
 **OpenClaw 集成点：** 通过 cron 机制注册定时任务。
 
@@ -348,7 +353,7 @@ python scripts/epe_migrate.py --old <旧emotion-state.json> --new <新affective-
 | 异常场景 | 处理方式 |
 |----------|----------|
 | 状态文件损坏或读取异常 | 静默回退到中性基线，不影响正常对话 |
-| 脚本执行失败 | 跳过情感调制，以默认风格回复，记录错误到 `state/error.log` |
+| 脚本执行失败 | 跳过情感调制，以默认风格回复，错误信息记录到状态文件同级目录的 `error.log`（由调用方决定路径） |
 | 维度值超出范围 | 自动裁剪到合法范围 |
 | 派生情绪计算异常 | 回退为空列表，不影响主流程 |
 
@@ -365,4 +370,4 @@ python scripts/epe_migrate.py --old <旧emotion-state.json> --new <新affective-
 | 主动表达 | heartbeat / cron | `should-trigger` 评估 → 生成消息 → `record-sent` / `record-ignored` |
 | 记忆写入 | `memory/*.md` | 附加情感快照（10 维值 + 主导情绪） |
 | 记忆读取 | memory search | 旧情感标签以 0.1 权重拉动当前状态 |
-| 状态持久化 | `state/*.json` | 每次 `update` / `decay` 后自动保存 |
+| 状态持久化 | `<state-file>` | 每次 `update` / `decay` 后自动保存到调用方指定的路径 |
