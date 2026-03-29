@@ -69,36 +69,76 @@ P = P_base × M_emotion × M_relationship × M_suppression
 
 冷却期内 P_base 强制为 0。
 
-## 6. "想说但不说"机制
+## 6. 门控变量："想说但不说"机制
 
-两个隐变量驱动内心戏：
+概率通过后，消息还需经过两道门控才会真正发送。这使主动表达不再是纯概率抽签，而是模拟了人类"犹豫→评估→决定"的心理过程。
 
-### inhibition（抑制值）
+### Gate 1: inhibition（抑制/怕打扰）
+
+```
+inhibition ∈ [0, 0.95]
+```
+
+表示"想说但怕打扰对方"的心理。越高越倾向忍住不说。
+
+**计算因子：**
+
+| 因子 | 影响 | 说明 |
+|------|------|------|
+| 基础值 | +0.15 | 每个人都有一点社交焦虑 |
+| 高疲劳（>0.4） | +(fatigue-0.4)×0.5 | 累了不想费力表达 |
+| 低自信（<0.4） | +(0.4-confidence)×0.4 | 不确定该不该说 |
+| 被忽略次数 | +ignored×0.15 | 害怕再被忽略 |
+| 关系阶段 | stranger +0.3, acquaintance +0.15, familiar +0.05, companion 0, intimate -0.05 | 越亲密越放得开 |
+| 负面情绪（valence<-0.2） | +\|valence\|×0.2 | 怕传播负能量 |
+
+**判定：** 生成随机数 r，若 r < inhibition → 消息被抑制，记录到 `suppressed_log`。
+
+**被抑制的消息不会消失**——它们留在 `suppressed_log` 中（最多保留 20 条），Agent 可以在之后的对话中自然提到"其实刚才我想说……但没好意思"，这增加了人格的真实感。
+
+### Gate 2: response_expectancy（预期被回应的概率）
+
+```
+response_expectancy ∈ [0.05, 0.95]
+```
+
+表示"这条消息发出去，对方会不会搭理我"。低于阈值（默认 0.25）则放弃发送。
+
+**计算因子：**
+
+| 因子 | 影响 | 说明 |
+|------|------|------|
+| 关系阶段基线 | stranger 0.2, acquaintance 0.4, familiar 0.6, companion 0.75, intimate 0.85 | 越亲密越有信心 |
+| 被忽略次数 | -ignored×0.15 | 历史教训降低预期 |
+| 消息类型 | greeting ×0.7, sharing ×0.5, caring ×0.8, musing ×0.3, emotional ×0.6, reminiscing ×0.4 | caring 最容易被回应 |
+| 深夜/凌晨 | ×0.3 | 23:00-08:00 人大概率在睡觉 |
+
+**判定：** 若 response_expectancy < 0.25 → 放弃发送。
+
+### should-trigger 完整返回值
 
 ```json
 {
-  "inhibition": 0.72,
-  "reason": "上次分享没有得到回应",
-  "suppressed_message": "想给你看一张照片",
-  "suppressed_type": "sharing"
+  "should_send": true,
+  "message_type": "sharing",
+  "probability": 0.42,
+  "inhibition": 0.18,
+  "response_expectancy": 0.65,
+  "reason": "passed all gates"
 }
 ```
 
-- 范围：0.0（完全不抑制）~ 1.0（完全压制）
-- 影响：M_suppression = 1 - inhibition
-- 衰减：每小时 × 0.95（约 14h 半衰期）
-- 增长：被忽略 +0.3，被冷淡回应 +0.15
-
-### need_for_response（表达需求）
-
-- 范围：0.0 ~ 1.0
-- 每次抑制后 +0.1，成功表达后归零
-- 当 need_for_response > 0.7 时，inhibition 衰减速度 ×2（憋不住了）
-- 当 need_for_response > 0.9 时，忽略 inhibition 直接发送（极少触发）
-
-### 行为效果
-
-被抑制的消息记录在 `suppressed_expressions[]` 中，产生 **元情绪**（如"想说又不敢说的焦虑"），影响整体情感状态。
+被抑制时：
+```json
+{
+  "should_send": false,
+  "message_type": "sharing",
+  "probability": 0.42,
+  "inhibition": 0.45,
+  "suppressed": true,
+  "reason": "inhibited (wanted to say but held back)"
+}
+```
 
 ## 7. 安全约束
 

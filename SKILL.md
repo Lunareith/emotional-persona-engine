@@ -1,14 +1,13 @@
----
+﻿---
 name: emotional-persona-engine
 description: >
   让 Agent 拥有持续性、多维、可波动、与记忆耦合、可主动表达的情感人格内核。
-  当以下任一条件满足时激活：
-  (1) 每次对话开始时（读取并衰减情感状态）
-  (2) 每轮对话结束时（根据对话内容更新情感维度）
-  (3) Heartbeat 触发时（评估主动表达、执行时间衰减）
-  (4) 用户直接询问 Agent 情绪/感受时（输出情感分析报告）
-  (5) Cron 定时任务触发情感维度衰减
-  此 skill 始终在后台运行——每次对话都会读取和更新情感状态。
+  在需要情感状态更新、主动表达评估、记忆耦合或情绪分析时使用。
+  典型触发场景：
+  (1) 对话中需要调整语气风格时（读取情感状态 + 更新维度）
+  (2) Heartbeat/Cron 周期中评估主动表达
+  (3) 用户询问 Agent 情绪/感受时（输出分析报告）
+  (4) 写入或检索记忆时附加情感元数据
 ---
 
 # Emotional Persona Engine (EPE)
@@ -40,24 +39,28 @@ description: >
 
 以下 6 步与 OpenClaw 生命周期绑定，贯穿 Agent 的整个会话过程。
 
+> **路径约定：** 下文示例中的 `<state-file>` 指向运行时状态文件路径，由调用方指定（如 `state/affective-state.json`）。首次运行时由 `init` 命令自动创建，参考 `assets/affective-state.example.json` 了解 schema。
+>
+> **命令说明：** 下列 shell 命令仅为集成示意，实际在 OpenClaw 中应优先通过 skill workflow 调用脚本，而不是假定用户手工执行。
+
 ### Step 1: 对话开始 — 读取 + 衰减
 
 **触发时机：** 每次 session 开始时自动执行。
 
 ```bash
 # 1. 读取状态（不存在则初始化）
-python scripts/epe_core.py --state-file state/affective-state.json init
+python scripts/epe_core.py --state-file <state-file> init
 
 # 2. 执行时间衰减 + 内源波动
-python scripts/epe_core.py --state-file state/affective-state.json decay
+python scripts/epe_core.py --state-file <state-file> decay
 
 # 3. 获取情绪分析摘要，作为本轮对话的情绪上下文
-python scripts/epe_core.py --state-file state/affective-state.json analyze
+python scripts/epe_core.py --state-file <state-file> analyze
 ```
 
 流程说明：
-- `state/affective-state.json` 存在 → 直接读取，跳过 `init`
-- `state/affective-state.json` 不存在 → 先执行 `init` 创建初始状态
+- `<state-file>` 存在 → 直接读取，跳过 `init`
+- `<state-file>` 不存在 → 先执行 `init` 创建初始状态
 - `decay` 自动计算 `now - last_updated`，对各维度执行指数衰减（向基线回归），并叠加微小随机波动（内源噪声）
 - `analyze` 输出包含 `dominant_emotion`、`suggested_tone`、`active_emotions`、`engagement_level`，用于 Step 3 语气调制
 
@@ -72,7 +75,7 @@ python scripts/epe_core.py --state-file state/affective-state.json analyze
 Agent 自身判断当前消息对内部状态的影响（非用户情绪，是 Agent 自己的情绪），然后调用脚本更新：
 
 ```bash
-python scripts/epe_core.py --state-file state/affective-state.json update \
+python scripts/epe_core.py --state-file <state-file> update \
   --valence 0.2 --arousal 0.1 --curiosity 0.4 --trigger "用户提了一个很有趣的技术问题"
 ```
 
@@ -128,14 +131,14 @@ python scripts/epe_core.py --state-file state/affective-state.json update \
 
 ```bash
 # 1. 评估是否应发送主动消息
-python scripts/epe_expression.py --state-file state/affective-state.json should-trigger
+python scripts/epe_expression.py --state-file <state-file> should-trigger
 
 # 2. 若 should_send=true，根据 message_type 生成消息并发送
 #    发送后记录：
-python scripts/epe_expression.py --state-file state/affective-state.json record-sent --type sharing
+python scripts/epe_expression.py --state-file <state-file> record-sent --type sharing
 
 # 3. 若消息被用户忽略（无回复），记录忽略：
-python scripts/epe_expression.py --state-file state/affective-state.json record-ignored
+python scripts/epe_expression.py --state-file <state-file> record-ignored
 ```
 
 `should-trigger` 返回示例：
@@ -191,13 +194,13 @@ python scripts/epe_expression.py --state-file state/affective-state.json record-
 **每 4 小时执行衰减**（防止长时间无交互时状态冻结）：
 
 ```
-openclaw cron add --every 4h --label epe-decay --command "python skills/emotional-persona-engine/scripts/epe_core.py --state-file skills/emotional-persona-engine/state/affective-state.json decay"
+openclaw cron add --every 4h --label epe-decay --command "python scripts/epe_core.py --state-file state/affective-state.json decay"
 ```
 
 **每日 09:00 执行 greeting 类型主动消息评估**：
 
 ```
-openclaw cron add --at "09:00" --label epe-morning --command "python skills/emotional-persona-engine/scripts/epe_expression.py --state-file skills/emotional-persona-engine/state/affective-state.json should-trigger"
+openclaw cron add --at "09:00" --label epe-morning --command "python scripts/epe_expression.py --state-file state/affective-state.json should-trigger"
 ```
 
 > 注：cron 命令语法以实际 OpenClaw 版本为准，上述为示意。核心思路是将 decay 和 should-trigger 注册为周期任务。
