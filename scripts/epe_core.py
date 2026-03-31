@@ -80,7 +80,10 @@ PERSONA_PRESETS = {
 
 DIMENSIONS = list(DEFAULT_BASELINE.keys())
 MAX_DELTA_PER_STEP = 0.35
+MAX_COUPLING_DELTA = 0.15  # Max impact per coupling rule to prevent oscillation
 MAX_HISTORY_ENTRIES = 200
+HISTORY_COMPRESS_THRESHOLD = 200  # Compress when exceeding this
+HISTORY_COMPRESS_BATCH = 50       # Aggregate every N old entries into 1
 
 # ============================================================
 # Utility
@@ -91,13 +94,14 @@ def now_iso():
 
 
 def parse_iso(s):
+    """Parse ISO8601 string. Returns None if s is None or unparseable."""
     if s is None:
-        return datetime.now(timezone.utc)
+        return None
     s = s.replace("Z", "+00:00")
     try:
         return datetime.fromisoformat(s)
     except Exception:
-        return datetime.now(timezone.utc)
+        return None
 
 
 def clamp(value, dim):
@@ -116,9 +120,38 @@ def save_state(state, path):
         json.dump(state, f, indent=2, ensure_ascii=False)
 
 
-def get_circadian_phase(dt=None):
+# ============================================================
+# Timezone Support
+# ============================================================
+
+def get_user_timezone(state=None):
+    """Get user timezone from state config, default to UTC."""
+    tz_name = None
+    if state:
+        tz_name = state.get("config", {}).get("timezone")
+    if not tz_name:
+        tz_name = "UTC"
+    # Python 3.9+ has zoneinfo; fallback to fixed offset for common zones
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(tz_name)
+    except (ImportError, KeyError):
+        if tz_name == "UTC" or tz_name == "UTC+0":
+            return timezone.utc
+        if tz_name.startswith("UTC"):
+            try:
+                offset_str = tz_name[3:]
+                offset_hours = int(offset_str)
+                return timezone(timedelta(hours=offset_hours))
+            except (ValueError, IndexError):
+                pass
+        return timezone.utc
+
+
+def get_circadian_phase(dt=None, state=None):
     if dt is None:
-        dt = datetime.now()
+        tz = get_user_timezone(state)
+        dt = datetime.now(tz)
     h = dt.hour
     if 6 <= h < 10:
         return "morning"
@@ -141,6 +174,79 @@ def circadian_modifier(phase):
         "night":     (-0.03, -0.01),
     }
     return mods.get(phase, (0.0, 0.0))
+
+
+# ============================================================
+# Safety Boundaries
+# ============================================================
+
+def load_safety_boundaries():
+    """Load safety-boundaries.json config."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    skill_dir = os.path.dirname(script_dir)
+    path = os.path.join(skill_dir, "config", "safety-boundaries.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+# Load safety boundaries at module level
+_SAFETY_BOUNDARIES = load_safety_boundaries()
+
+
+def get_safety_clamps():
+    """Get emotion clamp ranges from safety-boundaries.json, falling back to DIM_RANGES."""
+    if not _SAFETY_BOUNDARIES:
+        return DIM_RANGES.copy()
+    ec = _SAFETY_BOUNDARIES.get("emotion_clamps", {})
+    clamps = {k: v for k, v in DIM_RANGES.items()}  # shallow copy tuples
+    if "min_valence" in ec:
+        clamps["valence"] = (ec["min_valence"], clamps["valence"][1])
+    if "max_valence" in ec:
+        clamps["valence"] = (clamps["valence"][0], ec["max_valence"])
+    if "max_arousal" in ec:
+        clamps["arousal"] = (clamps["arousal"][0], ec["max_arousal"])
+    if "max_frustration" in ec:
+        clamps["frustration"] = (clamps["frustration"][0], ec["max_frustration"])
+    if "max_fatigue" in ec:
+        clamps["fatigue"] = (clamps["fatigue"][0], ec["max_fatigue"])
+    if "min_confidence" in ec:
+        clamps["confidence"] = (ec["min_confidence"], clamps["confidence"][1])
+    return clamps
+
+
+def apply_safety_clamps(dims):
+    """Apply safety boundary clamps and force decay for extreme values."""
+    clamps = get_safety_clamps()
+    for dim in DIMENSIONS:
+        if dim in clamps:
+            lo, hi = clamps[dim]
+            dims[dim] = max(lo, min(hi, dims[dim]))
+
+    if _SAFETY_BOUNDARIES:
+        ec = _SAFETY_BOUNDARIES.get("emotion_clamps", {})
+        force_thresholds = ec.get("force_decay_threshold", {})
+        force_multiplier = ec.get("force_decay_multiplier", 3.0)
+        emergency_thresholds = ec.get("emergency_reset_threshold", {})
+
+        # Emergency reset for extreme values
+        for dim_key, threshold in emergency_thresholds.items():
+            if dim_key in dims and dims[dim_key] >= threshold:
+                dims[dim_key] = threshold * 0.7
+
+        # Force accelerated decay toward baseline for high values
+        for dim_key, threshold in force_thresholds.items():
+            if dim_key == "valence_negative":
+                if dims.get("valence", 0) < threshold:
+                    excess = threshold - dims["valence"]
+                    dims["valence"] += excess * 0.1 * force_multiplier
+            elif dim_key in dims and dims[dim_key] > threshold:
+                excess = dims[dim_key] - threshold
+                dims[dim_key] -= excess * 0.1 * force_multiplier
+
+    return dims
 
 
 # ============================================================
@@ -185,6 +291,9 @@ def create_initial_state(persona_name="default"):
         "schema_version": 2,
         "engine": "emotional-persona-engine",
         "agent_id": "default",
+        "config": {
+            "timezone": "UTC"
+        },
         "core_state": {
             "dimensions": baseline_dims.copy(),
             "last_update": ts,
@@ -249,6 +358,7 @@ def create_initial_state(persona_name="default"):
         },
         "history": {
             "recent_states": [],
+            "compressed_states": [],
             "max_entries": MAX_HISTORY_ENTRIES
         }
     }
@@ -263,6 +373,12 @@ def apply_decay(state):
     baseline = state["persona_baseline"]["dimensions"]
     last_update = parse_iso(state["core_state"]["last_update"])
     now_dt = datetime.now(timezone.utc)
+
+    # Handle parse failure gracefully
+    if last_update is None:
+        state["core_state"]["last_update"] = now_iso()
+        return state
+
     elapsed_minutes = max(0, (now_dt - last_update).total_seconds() / 60.0)
     hours_elapsed = elapsed_minutes / 60.0
 
@@ -276,8 +392,8 @@ def apply_decay(state):
         bl = baseline[dim]
         dims[dim] = bl + (dims[dim] - bl) * decay_factor
 
-    # Circadian modulation
-    phase = get_circadian_phase(datetime.now())
+    # Circadian modulation (timezone-aware)
+    phase = get_circadian_phase(state=state)
     state["dynamics"]["circadian_phase"] = phase
     arousal_mod, valence_mod = circadian_modifier(phase)
     dims["arousal"] += arousal_mod
@@ -303,16 +419,26 @@ def apply_decay(state):
         dims["curiosity"] += random.uniform(0.05, 0.15)
         dims["arousal"] += random.uniform(0.02, 0.08)
 
-    # Clamp
+    # Clamp + safety boundaries
     for dim in DIMENSIONS:
         dims[dim] = clamp(dims[dim], dim)
+    dims = apply_safety_clamps(dims)
 
-    # 关系衰减（长时间不互动）
+    # 关系衰减（长时间不互动）- 四维度差异化衰减
     rel = state.get("relationship", {})
     rv = rel.get("rel_vector", {})
     if rv and hours_elapsed > 48:
-        decay_factor = min(0.01, (hours_elapsed - 48) * 0.0001)
-        rv["closeness"] = max(0, rv["closeness"] - decay_factor)
+        base_decay = min(0.01, (hours_elapsed - 48) * 0.0001)
+        # 不同维度衰减速率：closeness 最快，trust 最慢
+        rel_decay_rates = {
+            "closeness": 1.0,       # 最快衰减
+            "investment": 0.6,      # 中等偏快
+            "understanding": 0.3,   # 缓慢衰减
+            "trust": 0.15           # 最慢衰减
+        }
+        for dim_name, rate_mult in rel_decay_rates.items():
+            if dim_name in rv:
+                rv[dim_name] = max(0, rv[dim_name] - base_decay * rate_mult)
         rel["rel_vector"] = rv
         state["relationship"] = rel
 
@@ -321,50 +447,60 @@ def apply_decay(state):
 
 
 # ============================================================
-# Coupling (8 rules)
+# Coupling (8 rules, with delta cap)
 # ============================================================
+
+def _capped_delta(value, cap=MAX_COUPLING_DELTA):
+    """Cap coupling delta to prevent oscillation."""
+    return max(-cap, min(cap, value))
+
 
 def apply_coupling(dims):
     # 1. frustration>0.3 -> valence -= (frustration-0.3)*0.3
     if dims["frustration"] > 0.3:
-        dims["valence"] -= (dims["frustration"] - 0.3) * 0.3
+        delta = _capped_delta((dims["frustration"] - 0.3) * 0.3)
+        dims["valence"] -= delta
 
     # 2. fatigue>0.4 -> arousal -= ..., curiosity -= ...
     if dims["fatigue"] > 0.4:
         excess = dims["fatigue"] - 0.4
-        dims["arousal"] -= excess * 0.4
-        dims["curiosity"] -= excess * 0.3
+        dims["arousal"] -= _capped_delta(excess * 0.4)
+        dims["curiosity"] -= _capped_delta(excess * 0.3)
 
     # 3. fulfillment>0.4 -> valence += (fulfillment-0.4)*0.2
     if dims["fulfillment"] > 0.4:
-        dims["valence"] += (dims["fulfillment"] - 0.4) * 0.2
+        delta = _capped_delta((dims["fulfillment"] - 0.4) * 0.2)
+        dims["valence"] += delta
 
     # 4. curiosity>0.5 -> arousal += (curiosity-0.5)*0.15
     if dims["curiosity"] > 0.5:
-        dims["arousal"] += (dims["curiosity"] - 0.5) * 0.15
+        delta = _capped_delta((dims["curiosity"] - 0.5) * 0.15)
+        dims["arousal"] += delta
 
     # 5. affiliation>0.4 and care>0.4 -> valence += excess*0.1
     if dims["affiliation"] > 0.4 and dims["care"] > 0.4:
         excess = min(dims["affiliation"] - 0.4, dims["care"] - 0.4)
-        dims["valence"] += excess * 0.1  # max 0.06 instead of 0.09
+        dims["valence"] += _capped_delta(excess * 0.1)
 
     # 6. confidence<0.3 and arousal>0.3 -> frustration += ...
     if dims["confidence"] < 0.3 and dims["arousal"] > 0.3:
-        dims["frustration"] += (0.3 - dims["confidence"]) * dims["arousal"] * 0.2
+        delta = _capped_delta((0.3 - dims["confidence"]) * dims["arousal"] * 0.2)
+        dims["frustration"] += delta
 
     # 7. frustration>0.4 and fatigue>0.4 -> dominance -= ...
     if dims["frustration"] > 0.4 and dims["fatigue"] > 0.4:
-        dims["dominance"] -= dims["frustration"] * dims["fatigue"] * 0.3
+        delta = _capped_delta(dims["frustration"] * dims["fatigue"] * 0.3)
+        dims["dominance"] -= delta
 
     # 8. confidence>0.7 and fulfillment>0.5 -> dominance += 0.05
     if dims["confidence"] > 0.7 and dims["fulfillment"] > 0.5:
-        dims["dominance"] += 0.05
+        dims["dominance"] += _capped_delta(0.05)
 
     return dims
 
 
 # ============================================================
-# Derived Emotions (20 types)
+# Derived Emotions (22 types: added surprise & touched)
 # ============================================================
 
 EMOTION_DESCRIPTIONS = {
@@ -375,6 +511,8 @@ EMOTION_DESCRIPTIONS = {
     "warm_care": "Warmth and caring toward others",
     "self_assured": "Confident and in control",
     "gratitude": "Thankful and appreciative",
+    "surprise": "Pleasantly surprised by something unexpected",
+    "touched": "Deeply moved by kindness or emotional depth",
     "disappointment": "Let down or unfulfilled",
     "frustrated": "Blocked and powerless",
     "anxiety": "Worried and uneasy",
@@ -405,14 +543,13 @@ def compute_derived_emotions(dims, state):
     ful = dims["fulfillment"]
 
     # hours since last event (for 'missing')
-    last_evt = state["dynamics"].get("last_event_time")
-    if last_evt:
-        hours_since = max(0, (datetime.now(timezone.utc) - parse_iso(last_evt)).total_seconds() / 3600.0)
+    last_evt_parsed = parse_iso(state["dynamics"].get("last_event_time"))
+    if last_evt_parsed:
+        hours_since = max(0, (datetime.now(timezone.utc) - last_evt_parsed).total_seconds() / 3600.0)
     else:
-        # Fallback: use last_update time
-        last_upd = state["core_state"].get("last_update")
-        if last_upd:
-            hours_since = max(0, (datetime.now(timezone.utc) - parse_iso(last_upd)).total_seconds() / 3600.0)
+        last_upd_parsed = parse_iso(state["core_state"].get("last_update"))
+        if last_upd_parsed:
+            hours_since = max(0, (datetime.now(timezone.utc) - last_upd_parsed).total_seconds() / 3600.0)
         else:
             hours_since = 0
 
@@ -431,6 +568,14 @@ def compute_derived_emotions(dims, state):
     add("warm_care",       care_v > 0.5 and aff > 0.3,                 (care_v + aff * 0.5) / 1.5)
     add("self_assured",    conf > 0.6 and d > 0.2,                     (conf + d * 0.3) / 1.3)
     add("gratitude",       v > 0.3 and aff > 0.4 and ful > 0.3,       (v + aff + ful) / 3)
+
+    # NEW: surprise - sudden positive arousal spike with positive valence
+    add("surprise",        a > 0.4 and v > 0.2 and cur > 0.3,         (a + v + cur * 0.3) / 2.3)
+
+    # NEW: touched - deeply moved by emotional connection
+    add("touched",         care_v > 0.4 and aff > 0.5 and v > 0.2 and ful > 0.2,
+                           (care_v + aff + v + ful) / 4)
+
     add("disappointment",  v < -0.2 and ful < 0.2,                     (-v + (1 - ful) * 0.5) / 1.5)
     add("frustrated",      fru > 0.4 and d < 0.1,                      (fru + max(0, -d) * 0.5) / 1.5)
     add("anxiety",         a > 0.3 and v < -0.1 and d < 0,             (a + (-v) + (-d)) / 3)
@@ -616,8 +761,58 @@ def consistency_check(state, old_dims, new_dims):
 
 
 # ============================================================
-# History
+# History (with compression)
 # ============================================================
+
+def compress_history(hist):
+    """Compress old history entries by aggregating batches into summary entries."""
+    recent = hist.get("recent_states", [])
+    compressed = hist.get("compressed_states", [])
+
+    if len(recent) <= HISTORY_COMPRESS_THRESHOLD:
+        return hist
+
+    # Keep the most recent half, compress the older half
+    split_point = len(recent) - (HISTORY_COMPRESS_THRESHOLD // 2)
+    old_entries = recent[:split_point]
+    hist["recent_states"] = recent[split_point:]
+
+    # Aggregate old entries in batches
+    for i in range(0, len(old_entries), HISTORY_COMPRESS_BATCH):
+        batch = old_entries[i:i + HISTORY_COMPRESS_BATCH]
+        if not batch:
+            continue
+
+        # Average dimensions across the batch
+        avg_dims = {}
+        for dim in DIMENSIONS:
+            vals = [e["dimensions"].get(dim, 0) for e in batch if "dimensions" in e]
+            if vals:
+                avg_dims[dim] = round(sum(vals) / len(vals), 4)
+
+        # Collect dominant emotions
+        emotions = [e.get("dominant_emotion", "neutral") for e in batch]
+        emotion_counts = {}
+        for em in emotions:
+            emotion_counts[em] = emotion_counts.get(em, 0) + 1
+        top_emotion = max(emotion_counts, key=emotion_counts.get) if emotion_counts else "neutral"
+
+        # Collect triggers
+        triggers = [e.get("trigger") for e in batch if e.get("trigger")]
+
+        compressed.append({
+            "type": "compressed",
+            "time_start": batch[0].get("time"),
+            "time_end": batch[-1].get("time"),
+            "entry_count": len(batch),
+            "avg_dimensions": avg_dims,
+            "dominant_emotion": top_emotion,
+            "triggers_summary": triggers[:5] if triggers else []
+        })
+
+    hist["compressed_states"] = compressed
+    return hist
+
 
 def append_history(state, trigger=None):
     hist = state["history"]
@@ -628,9 +823,16 @@ def append_history(state, trigger=None):
         "trigger": trigger
     }
     hist["recent_states"].append(entry)
-    max_entries = hist.get("max_entries", MAX_HISTORY_ENTRIES)
-    if len(hist["recent_states"]) > max_entries:
-        hist["recent_states"] = hist["recent_states"][-max_entries:]
+
+    # Compress if exceeding threshold
+    if len(hist["recent_states"]) > HISTORY_COMPRESS_THRESHOLD:
+        hist = compress_history(hist)
+
+    # Ensure compressed_states exists
+    if "compressed_states" not in hist:
+        hist["compressed_states"] = []
+
+    state["history"] = hist
     return state
 
 
@@ -687,9 +889,10 @@ def cmd_update(args):
         # Reduce fatigue slightly
         dims["fatigue"] = max(0, dims["fatigue"] - positive_strength * 0.1)
 
-    # Step 4: Clamp
+    # Step 4: Clamp + safety boundaries
     for dim in DIMENSIONS:
         dims[dim] = clamp(dims[dim], dim)
+    dims = apply_safety_clamps(dims)
 
     # Step 5: Consistency check
     new_dims = consistency_check(state, old_dims, dims)
@@ -792,6 +995,8 @@ def cmd_analyze(args):
         "warm_care": "tender and attentive",
         "self_assured": "confident and steady",
         "gratitude": "warm and appreciative",
+        "surprise": "delighted and expressive",
+        "touched": "moved and heartfelt",
         "disappointment": "empathetic and understanding",
         "frustrated": "patient and solution-focused",
         "anxiety": "calm and reassuring",
@@ -850,10 +1055,12 @@ def cmd_analyze(args):
 def cmd_history(args):
     state = load_state(args.state_file)
     hist = state["history"].get("recent_states", [])
+    compressed = state["history"].get("compressed_states", [])
     limit = args.limit if args.limit else 10
     entries = hist[-limit:]
     output = {
         "total_entries": len(hist),
+        "total_compressed": len(compressed),
         "showing": len(entries),
         "entries": entries
     }
@@ -913,14 +1120,10 @@ def cmd_validate(args):
     # Check 3: last_update is valid ISO8601
     last_update = state.get("core_state", {}).get("last_update")
     if last_update:
-        try:
-            parsed = parse_iso(last_update)
-            # parse_iso falls back to now on failure; verify it actually parsed
-            if last_update.replace("Z", "+00:00") != "None":
-                checks_passed += 1
-            else:
-                errors.append("last_update is None")
-        except Exception:
+        parsed = parse_iso(last_update)
+        if parsed is not None:
+            checks_passed += 1
+        else:
             errors.append(f"last_update is not valid ISO8601: {last_update}")
     else:
         errors.append("last_update is missing")

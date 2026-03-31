@@ -31,15 +31,16 @@ COOLDOWNS = {
     "musing": 12, "emotional": 24, "reminiscing": 48
 }
 
-# Relationship stage multipliers [stranger, acquaintance, familiar, companion, intimate]
-STAGE_ORDER = ["acquaintance", "familiar", "companion", "close_friend", "intimate"]
+# Relationship stage multipliers — aligned with epe_core.py RELATIONSHIP_STAGES
+# Order: [stranger, acquaintance, familiar, companion, intimate]
+STAGE_ORDER = ["stranger", "acquaintance", "familiar", "companion", "intimate"]
 STAGE_MULTIPLIERS = {
-    "greeting":    [0.8, 1.0, 1.0, 1.0, 1.0],
-    "sharing":     [0.5, 0.8, 1.0, 1.1, 1.2],
-    "caring":      [0.5, 0.8, 1.2, 1.4, 1.5],
-    "musing":      [0.2, 0.6, 1.0, 1.2, 1.3],
-    "emotional":   [0.0, 0.3, 0.8, 1.2, 1.5],
-    "reminiscing": [0.0, 0.2, 0.7, 1.0, 1.3],
+    "greeting":    [0.3, 0.8, 1.0, 1.0, 1.0],
+    "sharing":     [0.1, 0.5, 0.8, 1.1, 1.2],
+    "caring":      [0.1, 0.5, 0.8, 1.4, 1.5],
+    "musing":      [0.0, 0.2, 0.6, 1.2, 1.3],
+    "emotional":   [0.0, 0.0, 0.3, 1.2, 1.5],
+    "reminiscing": [0.0, 0.0, 0.2, 1.0, 1.3],
 }
 
 MAX_DAILY = 5
@@ -73,8 +74,31 @@ def save_state(state, path):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
 
-def is_quiet_hours():
-    h = datetime.now().hour
+def get_user_timezone(state=None):
+    """Get user timezone from state config, default to UTC."""
+    tz_name = None
+    if state:
+        tz_name = state.get("config", {}).get("timezone")
+    if not tz_name:
+        tz_name = "UTC"
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(tz_name)
+    except (ImportError, KeyError):
+        if tz_name == "UTC" or tz_name == "UTC+0":
+            return timezone.utc
+        if tz_name.startswith("UTC"):
+            try:
+                offset_hours = int(tz_name[3:])
+                return timezone(timedelta(hours=offset_hours))
+            except (ValueError, IndexError):
+                pass
+        return timezone.utc
+
+def is_quiet_hours(state=None):
+    """Check quiet hours using the configured timezone."""
+    tz = get_user_timezone(state)
+    h = datetime.now(tz).hour
     if QUIET_START > QUIET_END:
         return h >= QUIET_START or h < QUIET_END
     return QUIET_START <= h < QUIET_END
@@ -83,7 +107,7 @@ def get_stage_index(stage):
     try:
         return STAGE_ORDER.index(stage)
     except ValueError:
-        return 1  # default to acquaintance
+        return 0  # default to stranger (safe fallback)
 
 
 # ============================================================
@@ -267,7 +291,7 @@ def should_trigger(state, state_file=None):
     """Evaluate whether to send a proactive message. Returns decision JSON."""
     dims = state["core_state"]["dimensions"]
     expr = state["expression"]
-    rel_stage = state["relationship"].get("stage", "acquaintance")
+    rel_stage = state["relationship"].get("stage", "stranger")
     stage_idx = get_stage_index(rel_stage)
 
     # Time since last event
@@ -286,7 +310,7 @@ def should_trigger(state, state_file=None):
             "hours_since_event": round(hours_since_event, 2)
         }
 
-    quiet = is_quiet_hours()
+    quiet = is_quiet_hours(state)
     candidates = []
     suppressed = []
 
@@ -332,8 +356,9 @@ def should_trigger(state, state_file=None):
     # Sort by probability desc
     candidates.sort(key=lambda x: x["probability"], reverse=True)
 
-    # Current hour for response expectancy calculation
-    hour = datetime.now().hour
+    # Current hour (timezone-aware) for response expectancy calculation
+    tz = get_user_timezone(state)
+    hour = datetime.now(tz).hour
 
     # Roll dice for each candidate
     for c in candidates:
