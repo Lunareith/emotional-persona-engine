@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-Emotional Persona Engine - Migration Tool
+Emotional Persona Engine - Migration Tool (Refactored v2.0)
 Migrate from emotion-ai emotion-state.json to EPE affective-state.json
+
+Optimizations:
+- Uses epe_io module
+- Includes proper schema format for rel_vector and compressed_states
 """
 
 import argparse
@@ -9,6 +13,10 @@ import json
 import os
 import sys
 from datetime import datetime, timezone
+
+# Import shared utilities
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from epe_io import now_iso, save_state, StateIOError
 
 DEFAULT_BASELINE = {
     "valence": 0.15, "arousal": 0.05, "dominance": 0.10,
@@ -60,13 +68,27 @@ def migrate(old_path, new_path):
     # care, fatigue stay at baseline
 
     # Build new state
-    now = datetime.now(timezone.utc).isoformat()
+    now = now_iso()
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    
+    # Extract total interactions for relationship
+    interaction_days = old.get("users", {}).get(user_key, {}).get("metadata", {}).get("total_interactions", 0)
+
+    # Convert old stage_score to new rel_vector
+    # Assume migrated state is 'familiar' with 50 score
+    old_score_normalized = 50.0 / 100.0
+    rel_vector = {
+        "closeness": min(1.0, old_score_normalized * 1.2),
+        "trust": min(1.0, old_score_normalized * 0.8),
+        "understanding": min(1.0, old_score_normalized * 0.6),
+        "investment": min(1.0, old_score_normalized * 0.5)
+    }
 
     new_state = {
         "schema_version": 2,
         "engine": "emotional-persona-engine",
         "agent_id": "default",
+        "config": {"timezone": "UTC"},
         "core_state": {
             "dimensions": new_dims,
             "last_update": now,
@@ -85,12 +107,13 @@ def migrate(old_path, new_path):
             "last_event_time": None, "consecutive_similar_events": 0
         },
         "relationship": {
-            "stage": "familiar",  # assume existing relationship
+            "stage": "familiar",
             "stage_score": 50.0,
             "stage_entered": now,
             "trust_accumulated": 25.0,
-            "interaction_days": old.get("users", {}).get(user_key, {}).get("metadata", {}).get("total_interactions", 0),
-            "milestones": [{"stage": "familiar", "time": now, "score": 50.0, "note": "migrated from emotion-ai"}]
+            "interaction_days": interaction_days,
+            "rel_vector": rel_vector,
+            "milestones": [{"from_stage": "stranger", "to_stage": "familiar", "time": now, "score": 50.0, "rel_vector": rel_vector.copy(), "note": "migrated from emotion-ai"}]
         },
         "consistency": {"last_snapshot": {}, "max_delta_per_step": 0.35, "violation_count": 0},
         "expression": {
@@ -98,7 +121,7 @@ def migrate(old_path, new_path):
             "cooldowns": {"greeting": None, "sharing": None, "caring": None, "musing": None, "emotional": None, "reminiscing": None},
             "daily_count": 0, "daily_count_date": today, "consecutive_ignored": 0, "paused_until": None
         },
-        "history": {"recent_states": [], "max_entries": 200}
+        "history": {"recent_states": [], "compressed_states": [], "max_entries": 200}
     }
 
     # Migrate history if available
@@ -118,9 +141,11 @@ def migrate(old_path, new_path):
             "trigger": entry.get("trigger", "migrated")
         })
 
-    os.makedirs(os.path.dirname(os.path.abspath(new_path)), exist_ok=True)
-    with open(new_path, "w", encoding="utf-8") as f:
-        json.dump(new_state, f, indent=2, ensure_ascii=False)
+    try:
+        # Save state using atomic write from epe_io
+        save_state(new_state, new_path, create_backup=False)
+    except StateIOError as e:
+        return {"error": str(e), "success": False}
 
     return {
         "status": "migrated",
@@ -128,7 +153,8 @@ def migrate(old_path, new_path):
         "new_dimensions": new_dims,
         "history_entries_migrated": len(new_state["history"]["recent_states"]),
         "relationship_stage": "familiar",
-        "output_file": new_path
+        "output_file": new_path,
+        "success": True
     }
 
 
@@ -139,11 +165,14 @@ def main():
     args = parser.parse_args()
 
     if not os.path.exists(args.old):
-        print(json.dumps({"error": f"File not found: {args.old}"}))
+        print(json.dumps({"error": f"File not found: {args.old}", "success": False}))
         sys.exit(1)
 
     result = migrate(args.old, args.new)
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    
+    if not result.get("success", False):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

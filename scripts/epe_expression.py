@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
-Emotional Persona Engine - Proactive Expression Engine
+Emotional Persona Engine - Proactive Expression Engine (Refactored v2.0)
 Determines when and what type of proactive message to send.
-Pure math computation, no LLM calls. Standard library only.
+
+Optimizations:
+- Uses epe_io module for atomic writes and shared utilities
+- Fixed should_trigger side effects (only mutates if returning True or explicitly logging)
+- Reads proactive_allowed from relationship-stages.json
+- Reads expression_limits from safety-boundaries.json
 """
 
 import argparse
@@ -12,9 +17,17 @@ import os
 import random
 import sys
 from datetime import datetime, timezone, timedelta
+from copy import deepcopy
+
+# Import shared utilities
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from epe_io import (
+    now_iso, parse_iso, load_state, save_state,
+    get_user_timezone, StateIOError, load_relationship_stages, load_safety_boundaries
+)
 
 # ============================================================
-# Constants
+# Constants & Defaults (overridden by config)
 # ============================================================
 
 MESSAGE_TYPES = ["greeting", "sharing", "caring", "musing", "emotional", "reminiscing"]
@@ -25,14 +38,13 @@ LAMBDA = {
     "musing": 0.06, "emotional": 0.03, "reminiscing": 0.02
 }
 
-# Cooldown periods (hours)
-COOLDOWNS = {
+# Default Cooldown periods (hours) - overridden by safety config if available
+DEFAULT_COOLDOWNS = {
     "greeting": 12, "sharing": 8, "caring": 6,
     "musing": 12, "emotional": 24, "reminiscing": 48
 }
 
-# Relationship stage multipliers — aligned with epe_core.py RELATIONSHIP_STAGES
-# Order: [stranger, acquaintance, familiar, companion, intimate]
+# Relationship stage multipliers
 STAGE_ORDER = ["stranger", "acquaintance", "familiar", "companion", "intimate"]
 STAGE_MULTIPLIERS = {
     "greeting":    [0.3, 0.8, 1.0, 1.0, 1.0],
@@ -43,65 +55,121 @@ STAGE_MULTIPLIERS = {
     "reminiscing": [0.0, 0.0, 0.2, 1.0, 1.3],
 }
 
-MAX_DAILY = 5
-QUIET_START = 23  # 23:00
-QUIET_END = 8     # 08:00
-QUIET_MULTIPLIER = 0.1
+# Default limits - overridden by safety config
+DEFAULT_MAX_DAILY = 5
+DEFAULT_QUIET_START = 23  # 23:00
+DEFAULT_QUIET_END = 8     # 08:00
+DEFAULT_QUIET_MULTIPLIER = 0.1
+DEFAULT_PAUSE_DURATION_HOURS = 24
+DEFAULT_MAX_IGNORED = 3
+
+# Runtime config storage
+_runtime_limits = {
+    "max_daily": DEFAULT_MAX_DAILY,
+    "quiet_start": DEFAULT_QUIET_START,
+    "quiet_end": DEFAULT_QUIET_END,
+    "quiet_multiplier": DEFAULT_QUIET_MULTIPLIER,
+    "pause_duration": DEFAULT_PAUSE_DURATION_HOURS,
+    "max_ignored": DEFAULT_MAX_IGNORED,
+    "min_interval_minutes": 0,
+    "cooldown_negative_minutes": 0
+}
+
+_stage_proactive_allowed = {}
+
+
+# ============================================================
+# Config Loading
+# ============================================================
+
+def load_runtime_config():
+    """Load limits from safety config and allowed types from relationship config."""
+    global _runtime_limits, _stage_proactive_allowed
+    skill_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    
+    # 1. Load safety boundaries for expression limits
+    safety = load_safety_boundaries(skill_dir)
+    if safety and "expression_limits" in safety:
+        limits = safety["expression_limits"]
+        if "max_daily_proactive" in limits:
+            _runtime_limits["max_daily"] = limits["max_daily_proactive"]
+            
+        if "quiet_hours" in limits:
+            qh = limits["quiet_hours"]
+            if "start" in qh:
+                _runtime_limits["quiet_start"] = int(qh["start"].split(":")[0])
+            if "end" in qh:
+                _runtime_limits["quiet_end"] = int(qh["end"].split(":")[0])
+                
+        if "quiet_hours_multiplier" in limits:
+            _runtime_limits["quiet_multiplier"] = limits["quiet_hours_multiplier"]
+            
+        if "max_consecutive_ignored_before_pause" in limits:
+            _runtime_limits["max_ignored"] = limits["max_consecutive_ignored_before_pause"]
+            
+        if "pause_duration_hours" in limits:
+            _runtime_limits["pause_duration"] = limits["pause_duration_hours"]
+            
+        if "min_interval_between_proactive_minutes" in limits:
+            _runtime_limits["min_interval_minutes"] = limits["min_interval_between_proactive_minutes"]
+            
+        if "cooldown_after_negative_feedback_minutes" in limits:
+            _runtime_limits["cooldown_negative_minutes"] = limits["cooldown_after_negative_feedback_minutes"]
+
+    # 2. Load relationship stages for allowed proactive types
+    rel_stages = load_relationship_stages(skill_dir)
+    if rel_stages and "stages" in rel_stages:
+        for stage in rel_stages["stages"]:
+            stage_id = stage.get("id")
+            modifiers = stage.get("behavior_modifiers", {})
+            allowed = modifiers.get("proactive_allowed", [])
+            if stage_id and allowed:
+                # Map external types to internal types if needed, or just use as is
+                # The config uses names like casual_chat, share_discovery etc.
+                # We need to map them to our internal 6 types
+                mapped_allowed = set()
+                if "greeting" in allowed: mapped_allowed.add("greeting")
+                if "share_discovery" in allowed: mapped_allowed.add("sharing")
+                if "casual_chat" in allowed: mapped_allowed.add("musing")
+                if "express_concern" in allowed: mapped_allowed.add("caring")
+                if "share_vulnerability" in allowed: mapped_allowed.add("emotional")
+                if "express_missing" in allowed: mapped_allowed.add("reminiscing")
+                
+                # Add default fallbacks if mapping is sparse
+                if not mapped_allowed and "greeting" in allowed:
+                    mapped_allowed.add("greeting")
+                    
+                _stage_proactive_allowed[stage_id] = list(mapped_allowed)
+
+
+def get_allowed_types(stage: str) -> list:
+    """Get allowed message types for a relationship stage."""
+    if stage in _stage_proactive_allowed and _stage_proactive_allowed[stage]:
+        return _stage_proactive_allowed[stage]
+    
+    # Fallback to hardcoded logic if config not loaded or empty
+    idx = get_stage_index(stage)
+    if idx == 0: return ["greeting"]
+    if idx == 1: return ["greeting", "sharing"]
+    if idx == 2: return ["greeting", "sharing", "musing", "caring"]
+    return MESSAGE_TYPES
 
 
 # ============================================================
 # Utility
 # ============================================================
 
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
-
-def parse_iso(s):
-    if s is None:
-        return None
-    s = s.replace("Z", "+00:00")
-    try:
-        return datetime.fromisoformat(s)
-    except Exception:
-        return None
-
-def load_state(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def save_state(state, path):
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
-
-def get_user_timezone(state=None):
-    """Get user timezone from state config, default to UTC."""
-    tz_name = None
-    if state:
-        tz_name = state.get("config", {}).get("timezone")
-    if not tz_name:
-        tz_name = "UTC"
-    try:
-        from zoneinfo import ZoneInfo
-        return ZoneInfo(tz_name)
-    except (ImportError, KeyError):
-        if tz_name == "UTC" or tz_name == "UTC+0":
-            return timezone.utc
-        if tz_name.startswith("UTC"):
-            try:
-                offset_hours = int(tz_name[3:])
-                return timezone(timedelta(hours=offset_hours))
-            except (ValueError, IndexError):
-                pass
-        return timezone.utc
-
 def is_quiet_hours(state=None):
     """Check quiet hours using the configured timezone."""
     tz = get_user_timezone(state)
     h = datetime.now(tz).hour
-    if QUIET_START > QUIET_END:
-        return h >= QUIET_START or h < QUIET_END
-    return QUIET_START <= h < QUIET_END
+    start = _runtime_limits["quiet_start"]
+    end = _runtime_limits["quiet_end"]
+    
+    if start > end:
+        return h >= start or h < end
+    return start <= h < end
+
 
 def get_stage_index(stage):
     try:
@@ -169,44 +237,72 @@ def compute_emotion_multiplier(msg_type, dims):
 # Suppression Factor
 # ============================================================
 
-def compute_suppression(expr_state, msg_type):
-    """Compute suppression factor from cooldowns, ignored count, pause."""
+def check_pause_and_limits(expr_state):
+    """Check global limits and pause state without side effects.
+    Returns (can_proceed, reason, should_reset_pause_flag)
+    """
     now_dt = datetime.now(timezone.utc)
 
     # Check pause
     paused_until = parse_iso(expr_state.get("paused_until"))
     if paused_until:
         if now_dt < paused_until:
-            return 0.0, f"paused until {expr_state['paused_until']}"
+            return False, f"paused until {expr_state['paused_until']}", False
         else:
-            # Pause expired: clear pause and reset ignored counter
-            expr_state["paused_until"] = None
-            expr_state["consecutive_ignored"] = 0
+            # Pause expired, signal to caller to reset flag
+            return True, "pause expired", True
 
     # Check daily limit
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if expr_state.get("daily_count_date") == today:
-        if expr_state.get("daily_count", 0) >= MAX_DAILY:
-            return 0.0, f"daily limit reached ({MAX_DAILY})"
-    else:
-        expr_state["daily_count"] = 0
-        expr_state["daily_count_date"] = today
+    daily_count = expr_state.get("daily_count", 0)
+    
+    # If it's a new day, count is effectively 0
+    if expr_state.get("daily_count_date") != today:
+        daily_count = 0
+        
+    if daily_count >= _runtime_limits["max_daily"]:
+        return False, f"daily limit reached ({_runtime_limits['max_daily']})", False
 
-    # Check cooldown for this type
+    # Check global minimum interval
+    min_interval = _runtime_limits["min_interval_minutes"]
+    if min_interval > 0:
+        # Find the most recent sent time across all types
+        cooldowns = expr_state.get("cooldowns", {})
+        latest_sent = None
+        for t, time_str in cooldowns.items():
+            dt = parse_iso(time_str)
+            if dt and (latest_sent is None or dt > latest_sent):
+                latest_sent = dt
+                
+        if latest_sent:
+            mins_since = (now_dt - latest_sent).total_seconds() / 60.0
+            if mins_since < min_interval:
+                return False, f"global interval cooldown ({min_interval - mins_since:.1f}m remaining)", False
+
+    return True, "ok", False
+
+
+def compute_suppression(expr_state, msg_type):
+    """Compute suppression factor for a specific message type."""
+    now_dt = datetime.now(timezone.utc)
+
+    # Check cooldown for this specific type
     last_sent = parse_iso(expr_state.get("cooldowns", {}).get(msg_type))
     if last_sent:
         hours_since = (now_dt - last_sent).total_seconds() / 3600.0
-        cooldown = COOLDOWNS[msg_type]
+        cooldown = DEFAULT_COOLDOWNS.get(msg_type, 12)
         if hours_since < cooldown:
             remaining = cooldown - hours_since
-            return 0.0, f"cooldown ({remaining:.1f}h remaining)"
+            return 0.0, f"type cooldown ({remaining:.1f}h remaining)"
 
     # Consecutive ignored penalty
     ignored = expr_state.get("consecutive_ignored", 0)
-    if ignored >= 3:
+    max_ignored = _runtime_limits["max_ignored"]
+    
+    if ignored >= max_ignored:
         return 0.0, f"too many ignored ({ignored})"
     elif ignored > 0:
-        penalty = 1.0 - (ignored * 0.3)
+        penalty = 1.0 - (ignored * (0.9 / max_ignored))
         return max(0.1, penalty), f"ignored penalty ({ignored}x)"
 
     return 1.0, "ok"
@@ -276,8 +372,11 @@ def compute_response_expectancy(dims, expression_state, relationship_stage, msg_
     }
     base *= type_factor.get(msg_type, 0.5)
 
-    # Late night / early morning lowers expectancy
-    if hour >= 23 or hour < 8:
+    start = _runtime_limits["quiet_start"]
+    end = _runtime_limits["quiet_end"]
+    is_quiet = (hour >= start or hour < end) if start > end else (start <= hour < end)
+    
+    if is_quiet:
         base *= 0.3
 
     return max(0.05, min(0.95, base))
@@ -289,6 +388,8 @@ def compute_response_expectancy(dims, expression_state, relationship_stage, msg_
 
 def should_trigger(state, state_file=None):
     """Evaluate whether to send a proactive message. Returns decision JSON."""
+    load_runtime_config()
+    
     dims = state["core_state"]["dimensions"]
     expr = state["expression"]
     rel_stage = state["relationship"].get("stage", "stranger")
@@ -310,11 +411,40 @@ def should_trigger(state, state_file=None):
             "hours_since_event": round(hours_since_event, 2)
         }
 
+    # Gate 0: Global limits (pause, daily count, global cooldown)
+    can_proceed, limit_reason, needs_pause_reset = check_pause_and_limits(expr)
+    
+    state_mutated = False
+    if needs_pause_reset:
+        expr["paused_until"] = None
+        expr["consecutive_ignored"] = 0
+        state_mutated = True
+        
+    if not can_proceed:
+        if state_mutated and state_file:
+            save_state(state, state_file)
+        return {
+            "should_send": False,
+            "reason": limit_reason,
+            "hours_since_event": round(hours_since_event, 2)
+        }
+
     quiet = is_quiet_hours(state)
     candidates = []
     suppressed = []
+    
+    # Filter allowed types by relationship stage
+    allowed_types = get_allowed_types(rel_stage)
 
     for msg_type in MESSAGE_TYPES:
+        if msg_type not in allowed_types:
+            suppressed.append({
+                "type": msg_type,
+                "reason": f"not allowed in stage '{rel_stage}'",
+                "base_probability": 0
+            })
+            continue
+            
         # Base probability (Poisson)
         lam = LAMBDA[msg_type]
         p_base = 1.0 - math.exp(-lam * hours_since_event)
@@ -329,10 +459,7 @@ def should_trigger(state, state_file=None):
         m_suppression, supp_reason = compute_suppression(expr, msg_type)
 
         # Quiet hours
-        if quiet:
-            m_quiet = QUIET_MULTIPLIER
-        else:
-            m_quiet = 1.0
+        m_quiet = _runtime_limits["quiet_multiplier"] if quiet else 1.0
 
         # Final probability
         p_final = p_base * m_emotion * m_relationship * m_suppression * m_quiet
@@ -384,9 +511,11 @@ def should_trigger(state, state_file=None):
                 # Keep only the most recent 20 entries
                 if len(expr["suppressed_log"]) > 20:
                     expr["suppressed_log"] = expr["suppressed_log"][-20:]
-                # Persist state
+                
+                # Persist state because we logged suppression
                 if state_file:
                     save_state(state, state_file)
+                    
                 return {
                     "should_send": False,
                     "reason": "inhibited (wanted to say but held back)",
@@ -401,6 +530,8 @@ def should_trigger(state, state_file=None):
             # Gate 2: Response expectancy check
             resp_expect = compute_response_expectancy(dims, expr, rel_stage, best_type, hour)
             if resp_expect < 0.25:
+                if state_mutated and state_file:
+                    save_state(state, state_file)
                 return {
                     "should_send": False,
                     "reason": f"low response expectancy ({resp_expect:.2f})",
@@ -413,6 +544,9 @@ def should_trigger(state, state_file=None):
                 }
 
             # All gates passed
+            if state_mutated and state_file:
+                save_state(state, state_file)
+                
             return {
                 "should_send": True,
                 "message_type": best_type,
@@ -426,6 +560,9 @@ def should_trigger(state, state_file=None):
                 "suppressed_types": suppressed
             }
 
+    if state_mutated and state_file:
+        save_state(state, state_file)
+        
     return {
         "should_send": False,
         "reason": "no trigger passed probability check",
@@ -442,12 +579,15 @@ def should_trigger(state, state_file=None):
 
 def record_sent(state, msg_type):
     """Record that a proactive message was sent."""
+    load_runtime_config()
     expr = state["expression"]
     expr["cooldowns"][msg_type] = now_iso()
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    
     if expr.get("daily_count_date") != today:
         expr["daily_count"] = 0
         expr["daily_count_date"] = today
+        
     expr["daily_count"] = expr.get("daily_count", 0) + 1
     expr["consecutive_ignored"] = 0  # reset on successful send
     return state
@@ -455,19 +595,29 @@ def record_sent(state, msg_type):
 
 def record_ignored(state):
     """Record that a proactive message was ignored by user."""
+    load_runtime_config()
     expr = state["expression"]
     expr["consecutive_ignored"] = expr.get("consecutive_ignored", 0) + 1
-    if expr["consecutive_ignored"] >= 3:
-        # Pause for 24 hours
-        pause_until = datetime.now(timezone.utc) + timedelta(hours=24)
+    
+    max_ignored = _runtime_limits["max_ignored"]
+    pause_hours = _runtime_limits["pause_duration"]
+    
+    if expr["consecutive_ignored"] >= max_ignored:
+        # Pause
+        pause_until = datetime.now(timezone.utc) + timedelta(hours=pause_hours)
         expr["paused_until"] = pause_until.isoformat()
+        
         # Log suppression
+        if "suppressed_log" not in expr:
+            expr["suppressed_log"] = []
+            
         expr["suppressed_log"].append({
             "time": now_iso(),
-            "reason": "3 consecutive ignored, pausing 24h"
+            "reason": f"{max_ignored} consecutive ignored, pausing {pause_hours}h"
         })
         if len(expr["suppressed_log"]) > 50:
             expr["suppressed_log"] = expr["suppressed_log"][-50:]
+            
     return state
 
 
@@ -476,7 +626,7 @@ def record_ignored(state):
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="EPE Proactive Expression Engine")
+    parser = argparse.ArgumentParser(description="EPE Proactive Expression Engine (v2.0)")
     parser.add_argument("--state-file", required=True, help="Path to affective-state.json")
 
     subparsers = parser.add_subparsers(dest="command")
@@ -490,29 +640,34 @@ def main():
 
     args = parser.parse_args()
 
-    if args.command == "should-trigger":
-        state = load_state(args.state_file)
-        result = should_trigger(state, state_file=args.state_file)
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+    try:
+        if args.command == "should-trigger":
+            state = load_state(args.state_file)
+            result = should_trigger(state, state_file=args.state_file)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
 
-    elif args.command == "record-sent":
-        state = load_state(args.state_file)
-        state = record_sent(state, args.type)
-        save_state(state, args.state_file)
-        print(json.dumps({"status": "recorded", "type": args.type}, ensure_ascii=False))
+        elif args.command == "record-sent":
+            state = load_state(args.state_file)
+            state = record_sent(state, args.type)
+            save_state(state, args.state_file)
+            print(json.dumps({"status": "recorded", "type": args.type}, ensure_ascii=False))
 
-    elif args.command == "record-ignored":
-        state = load_state(args.state_file)
-        state = record_ignored(state)
-        save_state(state, args.state_file)
-        print(json.dumps({
-            "status": "recorded",
-            "consecutive_ignored": state["expression"]["consecutive_ignored"],
-            "paused": state["expression"].get("paused_until") is not None
-        }, ensure_ascii=False))
+        elif args.command == "record-ignored":
+            state = load_state(args.state_file)
+            state = record_ignored(state)
+            save_state(state, args.state_file)
+            print(json.dumps({
+                "status": "recorded",
+                "consecutive_ignored": state["expression"]["consecutive_ignored"],
+                "paused": state["expression"].get("paused_until") is not None
+            }, ensure_ascii=False))
 
-    else:
-        parser.print_help()
+        else:
+            parser.print_help()
+            sys.exit(1)
+            
+    except StateIOError as e:
+        print(json.dumps({"error": str(e), "success": False}, ensure_ascii=False), file=sys.stderr)
         sys.exit(1)
 
 

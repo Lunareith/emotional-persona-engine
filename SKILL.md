@@ -69,9 +69,13 @@ python scripts/epe_core.py --state-file <state-file> analyze
 
 **触发时机：** 每轮对话回复时执行。
 
-Agent 自身判断当前消息对内部状态的影响（非用户情绪，是 Agent 自己的情绪），然后调用脚本更新：
+Agent 可以自己评估影响，或者使用新增的 `evaluate` 辅助命令获取参考增量：
 
 ```bash
+# 可选：如果 Agent 不确定如何打分，可以先请求辅助评估
+python scripts/epe_core.py --state-file <state-file> evaluate --text "用户提了一个很有趣的技术问题"
+
+# 必须：更新内部维度状态
 python scripts/epe_core.py --state-file <state-file> update \
   --valence 0.2 --arousal 0.1 --curiosity 0.4 --trigger "用户提了一个很有趣的技术问题"
 ```
@@ -217,23 +221,29 @@ python scripts/epe_expression.py --state-file <state-file> record-ignored
 
 **触发时机：** OpenClaw cron 定时任务。
 
-建议配置两个 cron 任务：
+建议配置两个 cron 任务（使用 OpenClaw `systemEvent`）：
 
 **每 4 小时执行衰减**（防止长时间无交互时状态冻结）：
 
-```
-openclaw cron add --every 4h --label epe-decay \
-  --command "python scripts/epe_core.py --state-file <state-file> decay"
+```json
+{
+  "schedule": { "kind": "every", "everyMs": 14400000 },
+  "payload": { "kind": "systemEvent", "text": "【系统触发】请执行 EPE 情感状态时间衰减 (epe_core.py decay)。" },
+  "sessionTarget": "main"
+}
 ```
 
 **每日 09:00 执行 greeting 类型主动消息评估**：
 
-```
-openclaw cron add --at "09:00" --label epe-morning \
-  --command "python scripts/epe_expression.py --state-file <state-file> should-trigger"
+```json
+{
+  "schedule": { "kind": "cron", "expr": "0 9 * * *" },
+  "payload": { "kind": "systemEvent", "text": "【系统触发】请执行 EPE 主动表达评估 (epe_expression.py should-trigger)，若需发送则主动向 owner 问候。" },
+  "sessionTarget": "main"
+}
 ```
 
-> 注：cron 命令语法以实际 OpenClaw 版本为准，上述为示意。`<state-file>` 替换为实际运行时状态文件路径。
+> 注：通过 OpenClaw 的 `cron` tool 添加。`<state-file>` 替换为实际运行时状态文件路径。
 
 **OpenClaw 集成点：** 通过 cron 机制注册定时任务。
 
@@ -302,6 +312,7 @@ python scripts/epe_core.py --state-file <path> <command> [options]
 | `update` | `--valence 0.2 --arousal -0.1 ... [--trigger "描述"]` | 更新指定维度增量，执行完整更新管线 |
 | `get` | — | 读取完整状态（维度、派生情绪、元情绪、关系阶段） |
 | `analyze` | — | 生成分析报告（主导情绪、建议语气、参与度、趋势） |
+| `evaluate`| `--text <描述>` | （新增）基于简单规则的 NLP 辅助评估，输出参考的维度增量字典 |
 | `history` | `[--limit N]` | 查看变更历史（默认最近 10 条） |
 | `reset` | — | 重置为基线状态（保留历史和关系记录） |
 | `validate` | — | 验证状态文件完整性（schema、维度范围、字段完整性） |

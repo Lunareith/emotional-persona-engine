@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
-Emotional Persona Engine - Core State Engine
+Emotional Persona Engine - Core State Engine (Refactored v2.0)
 Pure math computation, no LLM calls. Standard library only.
+
+Optimizations:
+- Uses epe_io module for atomic writes and shared utilities
+- Loads decay_rates, inertia from persona JSON config
+- TypedDict type hints for core data structures
+- Structured JSON error output
 """
 
 import argparse
@@ -11,43 +17,323 @@ import math
 import os
 import random
 import sys
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from copy import deepcopy
+from typing import Dict, Any, Optional, List, Tuple, TypedDict
 
 # Fix Chinese character encoding on Windows console
 if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
+# Import shared utilities
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from epe_io import (
+    now_iso, parse_iso, load_state, save_state,
+    get_user_timezone, get_circadian_phase, circadian_modifier,
+    clamp, StateIOError, load_persona_config, load_safety_boundaries
+)
+
+
 # ============================================================
-# Constants
+# Type Definitions (TypedDict for type safety without full OOP)
 # ============================================================
 
-DECAY_RATES = {
-    "valence": 0.003, "arousal": 0.005, "dominance": 0.002,
-    "affiliation": 0.0008, "confidence": 0.0015, "curiosity": 0.004,
-    "frustration": 0.006, "care": 0.001, "fatigue": 0.002, "fulfillment": 0.003
-}
+class DimensionsDict(TypedDict):
+    """10-dimensional emotional state vector."""
+    valence: float
+    arousal: float
+    dominance: float
+    affiliation: float
+    confidence: float
+    curiosity: float
+    frustration: float
+    care: float
+    fatigue: float
+    fulfillment: float
 
-INERTIA = {
-    "valence": 0.30, "arousal": 0.20, "dominance": 0.45,
-    "affiliation": 0.55, "confidence": 0.50, "curiosity": 0.15,
-    "frustration": 0.25, "care": 0.50, "fatigue": 0.20, "fulfillment": 0.35
-}
 
-DIM_RANGES = {
+class RelationshipVector(TypedDict):
+    """4-dimensional relationship vector."""
+    closeness: float
+    trust: float
+    understanding: float
+    investment: float
+
+
+class CoreState(TypedDict):
+    """Core state container."""
+    dimensions: DimensionsDict
+    last_update: str
+    update_count: int
+
+
+class PersonaBaseline(TypedDict):
+    """Persona baseline definition."""
+    dimensions: DimensionsDict
+    persona_name: str
+    description: str
+
+
+class MetaEmotion(TypedDict):
+    """Meta-emotion reflection."""
+    feeling_about_feeling: Optional[str]
+    self_awareness_note: Optional[str]
+    last_reflection: Optional[str]
+
+
+class EndogenousWave(TypedDict):
+    """Endogenous oscillation parameters."""
+    phase: float
+    amplitude: float
+    period_hours: float
+
+
+class Dynamics(TypedDict):
+    """Dynamic state tracking."""
+    circadian_phase: str
+    task_load: float
+    endogenous_wave: EndogenousWave
+    last_event_time: Optional[str]
+    consecutive_similar_events: int
+
+
+class Milestone(TypedDict):
+    """Relationship stage transition milestone."""
+    from_stage: str
+    to_stage: str
+    time: str
+    score: float
+    rel_vector: RelationshipVector
+    note: Optional[str]
+
+
+class Relationship(TypedDict):
+    """Relationship state."""
+    stage: str
+    stage_score: float
+    stage_entered: Optional[str]
+    trust_accumulated: float
+    interaction_days: int
+    rel_vector: RelationshipVector
+    milestones: List[Milestone]
+
+
+class Consistency(TypedDict):
+    """Consistency tracking."""
+    last_snapshot: Dict[str, float]
+    max_delta_per_step: float
+    violation_count: int
+
+
+class Cooldowns(TypedDict):
+    """Message type cooldowns."""
+    greeting: Optional[str]
+    sharing: Optional[str]
+    caring: Optional[str]
+    musing: Optional[str]
+    emotional: Optional[str]
+    reminiscing: Optional[str]
+
+
+class Expression(TypedDict):
+    """Expression state."""
+    impulse_queue: List[Any]
+    suppressed_log: List[Any]
+    cooldowns: Cooldowns
+    daily_count: int
+    daily_count_date: Optional[str]
+    consecutive_ignored: int
+    paused_until: Optional[str]
+
+
+class HistoryEntry(TypedDict):
+    """Single history entry."""
+    time: str
+    dimensions: DimensionsDict
+    dominant_emotion: str
+    trigger: Optional[str]
+
+
+class History(TypedDict):
+    """History container."""
+    recent_states: List[HistoryEntry]
+    compressed_states: List[Any]
+    max_entries: int
+
+
+class Config(TypedDict):
+    """Runtime configuration."""
+    timezone: str
+
+
+class AffectiveState(TypedDict):
+    """Complete affective state."""
+    schema_version: int
+    engine: str
+    agent_id: str
+    config: Config
+    core_state: CoreState
+    persona_baseline: PersonaBaseline
+    derived_emotions: Dict[str, Any]
+    meta_emotion: MetaEmotion
+    dynamics: Dynamics
+    relationship: Relationship
+    consistency: Consistency
+    expression: Expression
+    history: History
+
+
+# ============================================================
+# Constants & Config (loaded from JSON, with fallbacks)
+# ============================================================
+
+DIM_RANGES: Dict[str, Tuple[float, float]] = {
     "valence": (-1, 1), "arousal": (-1, 1), "dominance": (-1, 1),
     "affiliation": (0, 1), "confidence": (0, 1), "curiosity": (0, 1),
     "frustration": (0, 1), "care": (0, 1), "fatigue": (0, 1), "fulfillment": (0, 1)
 }
 
-DEFAULT_BASELINE = {
+# These are loaded from persona config, but have fallback defaults
+DEFAULT_BASELINE: DimensionsDict = {
     "valence": 0.15, "arousal": 0.05, "dominance": 0.10,
     "affiliation": 0.20, "confidence": 0.60, "curiosity": 0.40,
     "frustration": 0.00, "care": 0.35, "fatigue": 0.00, "fulfillment": 0.20
 }
 
-PERSONA_PRESETS = {
+DEFAULT_DECAY_RATES: Dict[str, float] = {
+    "valence": 0.003, "arousal": 0.005, "dominance": 0.002,
+    "affiliation": 0.0008, "confidence": 0.0015, "curiosity": 0.004,
+    "frustration": 0.006, "care": 0.001, "fatigue": 0.002, "fulfillment": 0.003
+}
+
+DEFAULT_INERTIA: Dict[str, float] = {
+    "valence": 0.30, "arousal": 0.20, "dominance": 0.45,
+    "affiliation": 0.55, "confidence": 0.50, "curiosity": 0.15,
+    "frustration": 0.25, "care": 0.50, "fatigue": 0.20, "fulfillment": 0.35
+}
+
+DIMENSIONS: List[str] = list(DEFAULT_BASELINE.keys())
+MAX_DELTA_PER_STEP: float = 0.35
+MAX_COUPLING_DELTA: float = 0.15
+MAX_HISTORY_ENTRIES: int = 200
+HISTORY_COMPRESS_THRESHOLD: int = 200
+HISTORY_COMPRESS_BATCH: int = 50
+
+# Runtime config storage (loaded from JSON)
+_runtime_decay_rates: Dict[str, float] = {}
+_runtime_inertia: Dict[str, float] = {}
+_safety_boundaries: Optional[Dict] = None
+
+
+# ============================================================
+# Config Loading
+# ============================================================
+
+def load_runtime_config(skill_dir: str, persona_name: str = "default") -> None:
+    """Load decay rates and inertia from persona config."""
+    global _runtime_decay_rates, _runtime_inertia, _safety_boundaries
+    
+    config = load_persona_config(skill_dir, persona_name)
+    if config:
+        _runtime_decay_rates = config.get("decay_rates", DEFAULT_DECAY_RATES)
+        _runtime_inertia = config.get("inertia", DEFAULT_INERTIA)
+    else:
+        _runtime_decay_rates = DEFAULT_DECAY_RATES
+        _runtime_inertia = DEFAULT_INERTIA
+    
+    _safety_boundaries = load_safety_boundaries(skill_dir)
+
+
+def get_decay_rates() -> Dict[str, float]:
+    """Get current decay rates (from config or fallback)."""
+    return _runtime_decay_rates if _runtime_decay_rates else DEFAULT_DECAY_RATES
+
+
+def get_inertia() -> Dict[str, float]:
+    """Get current inertia values (from config or fallback)."""
+    return _runtime_inertia if _runtime_inertia else DEFAULT_INERTIA
+
+
+def get_safety_clamps() -> Dict[str, Tuple[float, float]]:
+    """Get emotion clamp ranges from safety-boundaries.json.
+    
+    Safety clamps never loosen the hard DIM_RANGES limits, they can only
+    tighten them. This prevents safety config from allowing physically
+    impossible values (e.g. negative confidence which is a unipolar dim).
+    """
+    if not _safety_boundaries:
+        return DIM_RANGES.copy()
+    
+    ec = _safety_boundaries.get("emotion_clamps", {})
+    # Start from DIM_RANGES and only tighten, never loosen
+    clamps = {k: (lo, hi) for k, (lo, hi) in DIM_RANGES.items()}
+    
+    if "min_valence" in ec:
+        lo, hi = clamps["valence"]
+        clamps["valence"] = (max(lo, ec["min_valence"]), hi)  # only tighten min
+    if "max_valence" in ec:
+        lo, hi = clamps["valence"]
+        clamps["valence"] = (lo, min(hi, ec["max_valence"]))  # only tighten max
+    if "max_arousal" in ec:
+        lo, hi = clamps["arousal"]
+        clamps["arousal"] = (lo, min(hi, ec["max_arousal"]))
+    if "max_frustration" in ec:
+        lo, hi = clamps["frustration"]
+        clamps["frustration"] = (lo, min(hi, ec["max_frustration"]))
+    if "max_fatigue" in ec:
+        lo, hi = clamps["fatigue"]
+        clamps["fatigue"] = (lo, min(hi, ec["max_fatigue"]))
+    if "min_confidence" in ec:
+        lo, hi = clamps["confidence"]
+        # min_confidence can only raise the floor, not lower it below 0
+        clamps["confidence"] = (max(lo, ec["min_confidence"]), hi)
+    
+    return clamps
+
+
+# ============================================================
+# Safety Boundaries
+# ============================================================
+
+def apply_safety_clamps(dims: DimensionsDict) -> DimensionsDict:
+    """Apply safety boundary clamps and force decay for extreme values."""
+    clamps = get_safety_clamps()
+    
+    for dim in DIMENSIONS:
+        if dim in clamps:
+            lo, hi = clamps[dim]
+            dims[dim] = max(lo, min(hi, dims[dim]))  # type: ignore
+
+    if _safety_boundaries:
+        ec = _safety_boundaries.get("emotion_clamps", {})
+        force_thresholds = ec.get("force_decay_threshold", {})
+        force_multiplier = ec.get("force_decay_multiplier", 3.0)
+        emergency_thresholds = ec.get("emergency_reset_threshold", {})
+
+        # Emergency reset for extreme values
+        for dim_key, threshold in emergency_thresholds.items():
+            if dim_key in dims and dims[dim_key] >= threshold:  # type: ignore
+                dims[dim_key] = threshold * 0.7  # type: ignore
+
+        # Force accelerated decay toward baseline for high values
+        for dim_key, threshold in force_thresholds.items():
+            if dim_key == "valence_negative":
+                if dims.get("valence", 0) < threshold:
+                    excess = threshold - dims["valence"]
+                    dims["valence"] += excess * 0.1 * force_multiplier
+            elif dim_key in dims and dims[dim_key] > threshold:  # type: ignore
+                excess = dims[dim_key] - threshold  # type: ignore
+                dims[dim_key] -= excess * 0.1 * force_multiplier  # type: ignore
+
+    return dims
+
+
+# ============================================================
+# Persona Presets (fallback when JSON not available)
+# ============================================================
+
+PERSONA_PRESETS: Dict[str, Dict[str, Any]] = {
     "default": {
         "dimensions": DEFAULT_BASELINE.copy(),
         "description": "Balanced, mildly positive baseline persona"
@@ -78,208 +364,27 @@ PERSONA_PRESETS = {
     }
 }
 
-DIMENSIONS = list(DEFAULT_BASELINE.keys())
-MAX_DELTA_PER_STEP = 0.35
-MAX_COUPLING_DELTA = 0.15  # Max impact per coupling rule to prevent oscillation
-MAX_HISTORY_ENTRIES = 200
-HISTORY_COMPRESS_THRESHOLD = 200  # Compress when exceeding this
-HISTORY_COMPRESS_BATCH = 50       # Aggregate every N old entries into 1
-
-# ============================================================
-# Utility
-# ============================================================
-
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
-
-
-def parse_iso(s):
-    """Parse ISO8601 string. Returns None if s is None or unparseable."""
-    if s is None:
-        return None
-    s = s.replace("Z", "+00:00")
-    try:
-        return datetime.fromisoformat(s)
-    except Exception:
-        return None
-
-
-def clamp(value, dim):
-    lo, hi = DIM_RANGES[dim]
-    return max(lo, min(hi, value))
-
-
-def load_state(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def save_state(state, path):
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
-
-
-# ============================================================
-# Timezone Support
-# ============================================================
-
-def get_user_timezone(state=None):
-    """Get user timezone from state config, default to UTC."""
-    tz_name = None
-    if state:
-        tz_name = state.get("config", {}).get("timezone")
-    if not tz_name:
-        tz_name = "UTC"
-    # Python 3.9+ has zoneinfo; fallback to fixed offset for common zones
-    try:
-        from zoneinfo import ZoneInfo
-        return ZoneInfo(tz_name)
-    except (ImportError, KeyError):
-        if tz_name == "UTC" or tz_name == "UTC+0":
-            return timezone.utc
-        if tz_name.startswith("UTC"):
-            try:
-                offset_str = tz_name[3:]
-                offset_hours = int(offset_str)
-                return timezone(timedelta(hours=offset_hours))
-            except (ValueError, IndexError):
-                pass
-        return timezone.utc
-
-
-def get_circadian_phase(dt=None, state=None):
-    if dt is None:
-        tz = get_user_timezone(state)
-        dt = datetime.now(tz)
-    h = dt.hour
-    if 6 <= h < 10:
-        return "morning"
-    elif 10 <= h < 14:
-        return "midday"
-    elif 14 <= h < 18:
-        return "afternoon"
-    elif 18 <= h < 22:
-        return "evening"
-    else:
-        return "night"
-
-
-def circadian_modifier(phase):
-    mods = {
-        "morning":   (0.02, 0.01),
-        "midday":    (0.01, 0.00),
-        "afternoon": (-0.01, 0.00),
-        "evening":   (-0.02, 0.01),
-        "night":     (-0.03, -0.01),
-    }
-    return mods.get(phase, (0.0, 0.0))
-
-
-# ============================================================
-# Safety Boundaries
-# ============================================================
-
-def load_safety_boundaries():
-    """Load safety-boundaries.json config."""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    skill_dir = os.path.dirname(script_dir)
-    path = os.path.join(skill_dir, "config", "safety-boundaries.json")
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-
-# Load safety boundaries at module level
-_SAFETY_BOUNDARIES = load_safety_boundaries()
-
-
-def get_safety_clamps():
-    """Get emotion clamp ranges from safety-boundaries.json, falling back to DIM_RANGES."""
-    if not _SAFETY_BOUNDARIES:
-        return DIM_RANGES.copy()
-    ec = _SAFETY_BOUNDARIES.get("emotion_clamps", {})
-    clamps = {k: v for k, v in DIM_RANGES.items()}  # shallow copy tuples
-    if "min_valence" in ec:
-        clamps["valence"] = (ec["min_valence"], clamps["valence"][1])
-    if "max_valence" in ec:
-        clamps["valence"] = (clamps["valence"][0], ec["max_valence"])
-    if "max_arousal" in ec:
-        clamps["arousal"] = (clamps["arousal"][0], ec["max_arousal"])
-    if "max_frustration" in ec:
-        clamps["frustration"] = (clamps["frustration"][0], ec["max_frustration"])
-    if "max_fatigue" in ec:
-        clamps["fatigue"] = (clamps["fatigue"][0], ec["max_fatigue"])
-    if "min_confidence" in ec:
-        clamps["confidence"] = (ec["min_confidence"], clamps["confidence"][1])
-    return clamps
-
-
-def apply_safety_clamps(dims):
-    """Apply safety boundary clamps and force decay for extreme values."""
-    clamps = get_safety_clamps()
-    for dim in DIMENSIONS:
-        if dim in clamps:
-            lo, hi = clamps[dim]
-            dims[dim] = max(lo, min(hi, dims[dim]))
-
-    if _SAFETY_BOUNDARIES:
-        ec = _SAFETY_BOUNDARIES.get("emotion_clamps", {})
-        force_thresholds = ec.get("force_decay_threshold", {})
-        force_multiplier = ec.get("force_decay_multiplier", 3.0)
-        emergency_thresholds = ec.get("emergency_reset_threshold", {})
-
-        # Emergency reset for extreme values
-        for dim_key, threshold in emergency_thresholds.items():
-            if dim_key in dims and dims[dim_key] >= threshold:
-                dims[dim_key] = threshold * 0.7
-
-        # Force accelerated decay toward baseline for high values
-        for dim_key, threshold in force_thresholds.items():
-            if dim_key == "valence_negative":
-                if dims.get("valence", 0) < threshold:
-                    excess = threshold - dims["valence"]
-                    dims["valence"] += excess * 0.1 * force_multiplier
-            elif dim_key in dims and dims[dim_key] > threshold:
-                excess = dims[dim_key] - threshold
-                dims[dim_key] -= excess * 0.1 * force_multiplier
-
-    return dims
-
 
 # ============================================================
 # State Initialization
 # ============================================================
 
-def create_initial_state(persona_name="default"):
-    # Try to load from config JSON first, fallback to built-in presets
-    preset = None
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    skill_dir = os.path.dirname(script_dir)
-
-    # Map persona names to config file names
-    config_map = {
-        "default": os.path.join(skill_dir, "config", "default-persona.json"),
-        "warm": os.path.join(skill_dir, "config", "persona-presets", "warm-companion.json"),
-        "analytical": os.path.join(skill_dir, "config", "persona-presets", "intellectual-partner.json"),
-        "energetic": os.path.join(skill_dir, "config", "persona-presets", "playful-friend.json"),
-        "calm": os.path.join(skill_dir, "config", "persona-presets", "calm-mentor.json"),
-    }
-
-    config_path = config_map.get(persona_name)
-    if config_path and os.path.exists(config_path):
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                config_data = json.load(f)
-            # Config files may use "dimensions" or "baseline" key
-            dims = config_data.get("dimensions", config_data.get("baseline", {}))
+def create_initial_state(persona_name: str = "default", skill_dir: Optional[str] = None) -> AffectiveState:
+    """Create initial state with persona preset."""
+    # Ensure runtime config is loaded
+    if skill_dir:
+        load_runtime_config(skill_dir, persona_name)
+    
+    # Try to load from config JSON first
+    preset: Optional[Dict[str, Any]] = None
+    
+    if skill_dir:
+        config = load_persona_config(skill_dir, persona_name)
+        if config:
+            dims = config.get("dimensions", config.get("baseline", {}))
             if dims and all(d in dims for d in DIMENSIONS):
-                preset = {"dimensions": dims, "description": config_data.get("description", "")}
-        except Exception:
-            pass
-
+                preset = {"dimensions": dims, "description": config.get("description", "")}
+    
     if preset is None:
         preset = PERSONA_PRESETS.get(persona_name, PERSONA_PRESETS["default"])
 
@@ -291,16 +396,14 @@ def create_initial_state(persona_name="default"):
         "schema_version": 2,
         "engine": "emotional-persona-engine",
         "agent_id": "default",
-        "config": {
-            "timezone": "UTC"
-        },
+        "config": {"timezone": "UTC"},
         "core_state": {
-            "dimensions": baseline_dims.copy(),
+            "dimensions": baseline_dims.copy(),  # type: ignore
             "last_update": ts,
             "update_count": 0
         },
         "persona_baseline": {
-            "dimensions": baseline_dims.copy(),
+            "dimensions": baseline_dims.copy(),  # type: ignore
             "persona_name": persona_name,
             "description": preset.get("description", "")
         },
@@ -368,13 +471,13 @@ def create_initial_state(persona_name="default"):
 # Decay & Endogenous Fluctuation
 # ============================================================
 
-def apply_decay(state):
+def apply_decay(state: AffectiveState) -> AffectiveState:
+    """Apply time-based decay and endogenous fluctuations."""
     dims = state["core_state"]["dimensions"]
     baseline = state["persona_baseline"]["dimensions"]
     last_update = parse_iso(state["core_state"]["last_update"])
     now_dt = datetime.now(timezone.utc)
 
-    # Handle parse failure gracefully
     if last_update is None:
         state["core_state"]["last_update"] = now_iso()
         return state
@@ -385,9 +488,11 @@ def apply_decay(state):
     if elapsed_minutes < 0.01:
         return state
 
+    decay_rates = get_decay_rates()
+    
     # Exponential decay toward baseline
     for dim in DIMENSIONS:
-        rate = DECAY_RATES[dim]
+        rate = decay_rates[dim]
         decay_factor = math.exp(-rate * elapsed_minutes)
         bl = baseline[dim]
         dims[dim] = bl + (dims[dim] - bl) * decay_factor
@@ -419,28 +524,27 @@ def apply_decay(state):
         dims["curiosity"] += random.uniform(0.05, 0.15)
         dims["arousal"] += random.uniform(0.02, 0.08)
 
-    # Clamp + safety boundaries
-    for dim in DIMENSIONS:
-        dims[dim] = clamp(dims[dim], dim)
+    # Safety boundaries first (tighten allowed range), then clamp to hard limits
     dims = apply_safety_clamps(dims)
+    for dim in DIMENSIONS:
+        dims[dim] = clamp(dims[dim], dim, DIM_RANGES)
 
-    # 关系衰减（长时间不互动）- 四维度差异化衰减
+    # Relationship decay (长时间不互动)
     rel = state.get("relationship", {})
     rv = rel.get("rel_vector", {})
     if rv and hours_elapsed > 48:
         base_decay = min(0.01, (hours_elapsed - 48) * 0.0001)
-        # 不同维度衰减速率：closeness 最快，trust 最慢
         rel_decay_rates = {
-            "closeness": 1.0,       # 最快衰减
-            "investment": 0.6,      # 中等偏快
-            "understanding": 0.3,   # 缓慢衰减
-            "trust": 0.15           # 最慢衰减
+            "closeness": 1.0,
+            "investment": 0.6,
+            "understanding": 0.3,
+            "trust": 0.15
         }
         for dim_name, rate_mult in rel_decay_rates.items():
             if dim_name in rv:
                 rv[dim_name] = max(0, rv[dim_name] - base_decay * rate_mult)
         rel["rel_vector"] = rv
-        state["relationship"] = rel
+        state["relationship"] = rel  # type: ignore
 
     state["core_state"]["last_update"] = now_iso()
     return state
@@ -450,12 +554,13 @@ def apply_decay(state):
 # Coupling (8 rules, with delta cap)
 # ============================================================
 
-def _capped_delta(value, cap=MAX_COUPLING_DELTA):
+def _capped_delta(value: float, cap: float = MAX_COUPLING_DELTA) -> float:
     """Cap coupling delta to prevent oscillation."""
     return max(-cap, min(cap, value))
 
 
-def apply_coupling(dims):
+def apply_coupling(dims: DimensionsDict) -> DimensionsDict:
+    """Apply dimension coupling rules."""
     # 1. frustration>0.3 -> valence -= (frustration-0.3)*0.3
     if dims["frustration"] > 0.3:
         delta = _capped_delta((dims["frustration"] - 0.3) * 0.3)
@@ -500,10 +605,10 @@ def apply_coupling(dims):
 
 
 # ============================================================
-# Derived Emotions (22 types: added surprise & touched)
+# Derived Emotions
 # ============================================================
 
-EMOTION_DESCRIPTIONS = {
+EMOTION_DESCRIPTIONS: Dict[str, str] = {
     "joy": "Feeling happy and uplifted",
     "contentment": "Peaceful satisfaction",
     "excitement": "High-energy enthusiasm",
@@ -529,18 +634,12 @@ EMOTION_DESCRIPTIONS = {
 }
 
 
-def compute_derived_emotions(dims, state):
-    results = []
-    v = dims["valence"]
-    a = dims["arousal"]
-    d = dims["dominance"]
-    aff = dims["affiliation"]
-    conf = dims["confidence"]
-    cur = dims["curiosity"]
-    fru = dims["frustration"]
-    care_v = dims["care"]
-    fat = dims["fatigue"]
-    ful = dims["fulfillment"]
+def compute_derived_emotions(dims: DimensionsDict, state: AffectiveState) -> List[Dict[str, Any]]:
+    """Compute 22 derived emotions from base dimensions."""
+    results: List[Dict[str, Any]] = []
+    v, a, d = dims["valence"], dims["arousal"], dims["dominance"]
+    aff, conf, cur = dims["affiliation"], dims["confidence"], dims["curiosity"]
+    fru, care_v, fat, ful = dims["frustration"], dims["care"], dims["fatigue"], dims["fulfillment"]
 
     # hours since last event (for 'missing')
     last_evt_parsed = parse_iso(state["dynamics"].get("last_event_time"))
@@ -553,7 +652,7 @@ def compute_derived_emotions(dims, state):
         else:
             hours_since = 0
 
-    def add(name, condition, intensity):
+    def add(name: str, condition: bool, intensity: float) -> None:
         if condition:
             results.append({
                 "emotion": name,
@@ -561,35 +660,30 @@ def compute_derived_emotions(dims, state):
                 "description": EMOTION_DESCRIPTIONS.get(name, "")
             })
 
-    add("joy",             v > 0.3 and a > 0.1,                       (v + a * 0.5) / 1.5)
-    add("contentment",     v > 0.2 and a < 0.1 and ful > 0.3,         (v + ful) / 2)
-    add("excitement",      a > 0.5 and v > 0.2,                        (a + v * 0.5) / 1.5)
-    add("curiosity_drive", cur > 0.5 and a > 0,                        (cur + a * 0.3) / 1.3)
-    add("warm_care",       care_v > 0.5 and aff > 0.3,                 (care_v + aff * 0.5) / 1.5)
-    add("self_assured",    conf > 0.6 and d > 0.2,                     (conf + d * 0.3) / 1.3)
-    add("gratitude",       v > 0.3 and aff > 0.4 and ful > 0.3,       (v + aff + ful) / 3)
-
-    # NEW: surprise - sudden positive arousal spike with positive valence
-    add("surprise",        a > 0.4 and v > 0.2 and cur > 0.3,         (a + v + cur * 0.3) / 2.3)
-
-    # NEW: touched - deeply moved by emotional connection
-    add("touched",         care_v > 0.4 and aff > 0.5 and v > 0.2 and ful > 0.2,
-                           (care_v + aff + v + ful) / 4)
-
-    add("disappointment",  v < -0.2 and ful < 0.2,                     (-v + (1 - ful) * 0.5) / 1.5)
-    add("frustrated",      fru > 0.4 and d < 0.1,                      (fru + max(0, -d) * 0.5) / 1.5)
-    add("anxiety",         a > 0.3 and v < -0.1 and d < 0,             (a + (-v) + (-d)) / 3)
-    add("irritation",      fru > 0.3 and a > 0.3 and v < 0,            (fru + a + (-v)) / 3)
-    add("weariness",       fat > 0.5 and a < 0.1,                      (fat + max(0, -a) * 0.3) / 1.3)
-    add("uncertainty",     conf < 0.3 and cur > 0.2,                   ((1 - conf) + cur * 0.3) / 1.3)
-    add("closeness",       aff > 0.5 and care_v > 0.3,                 (aff + care_v) / 2)
-    add("missing",         aff > 0.4 and care_v > 0.3 and hours_since > 24,
-                           (aff + care_v) / 2 * min(1.0, hours_since / 72.0))
-    add("pride",           ful > 0.5 and conf > 0.5 and v > 0.3,       (ful + conf + v) / 3)
-    add("guilt",           care_v > 0.4 and v < -0.2 and ful < 0.2,    (care_v + (-v) + (1 - ful)) / 3)
-    add("awe",             cur > 0.4 and a > 0.3 and d < 0,            (cur + a + (-d)) / 3)
-    add("empathy",         care_v > 0.5 and aff > 0.4 and a > 0.1,     (care_v + aff + a * 0.3) / 2.3)
-    add("boredom",         cur < 0.2 and a < -0.2 and ful < 0.2,       ((1 - cur) + (-a) + (1 - ful)) / 3)
+    add("joy", v > 0.3 and a > 0.1, (v + a * 0.5) / 1.5)
+    add("contentment", v > 0.2 and a < 0.1 and ful > 0.3, (v + ful) / 2)
+    add("excitement", a > 0.5 and v > 0.2, (a + v * 0.5) / 1.5)
+    add("curiosity_drive", cur > 0.5 and a > 0, (cur + a * 0.3) / 1.3)
+    add("warm_care", care_v > 0.5 and aff > 0.3, (care_v + aff * 0.5) / 1.5)
+    add("self_assured", conf > 0.6 and d > 0.2, (conf + d * 0.3) / 1.3)
+    add("gratitude", v > 0.3 and aff > 0.4 and ful > 0.3, (v + aff + ful) / 3)
+    add("surprise", a > 0.4 and v > 0.2 and cur > 0.3, (a + v + cur * 0.3) / 2.3)
+    add("touched", care_v > 0.4 and aff > 0.5 and v > 0.2 and ful > 0.2,
+        (care_v + aff + v + ful) / 4)
+    add("disappointment", v < -0.2 and ful < 0.2, (-v + (1 - ful) * 0.5) / 1.5)
+    add("frustrated", fru > 0.4 and d < 0.1, (fru + max(0, -d) * 0.5) / 1.5)
+    add("anxiety", a > 0.3 and v < -0.1 and d < 0, (a + (-v) + (-d)) / 3)
+    add("irritation", fru > 0.3 and a > 0.3 and v < 0, (fru + a + (-v)) / 3)
+    add("weariness", fat > 0.5 and a < 0.1, (fat + max(0, -a) * 0.3) / 1.3)
+    add("uncertainty", conf < 0.3 and cur > 0.2, ((1 - conf) + cur * 0.3) / 1.3)
+    add("closeness", aff > 0.5 and care_v > 0.3, (aff + care_v) / 2)
+    add("missing", aff > 0.4 and care_v > 0.3 and hours_since > 24,
+        (aff + care_v) / 2 * min(1.0, hours_since / 72.0))
+    add("pride", ful > 0.5 and conf > 0.5 and v > 0.3, (ful + conf + v) / 3)
+    add("guilt", care_v > 0.4 and v < -0.2 and ful < 0.2, (care_v + (-v) + (1 - ful)) / 3)
+    add("awe", cur > 0.4 and a > 0.3 and d < 0, (cur + a + (-d)) / 3)
+    add("empathy", care_v > 0.5 and aff > 0.4 and a > 0.1, (care_v + aff + a * 0.3) / 2.3)
+    add("boredom", cur < 0.2 and a < -0.2 and ful < 0.2, ((1 - cur) + (-a) + (1 - ful)) / 3)
 
     results.sort(key=lambda x: x["intensity"], reverse=True)
     return results
@@ -599,7 +693,8 @@ def compute_derived_emotions(dims, state):
 # Meta-Emotion
 # ============================================================
 
-def update_meta_emotion(state, derived):
+def update_meta_emotion(state: AffectiveState, derived: List[Dict[str, Any]]) -> AffectiveState:
+    """Update meta-emotion based on current emotional state."""
     meta = state["meta_emotion"]
     if not derived:
         meta["feeling_about_feeling"] = "emotionally quiet"
@@ -610,13 +705,13 @@ def update_meta_emotion(state, derived):
         intensity = dominant["intensity"]
         if intensity > 0.7:
             meta["feeling_about_feeling"] = "strongly feeling " + name
-            meta["self_awareness_note"] = "High-intensity " + name + " - should be mindful of expression"
+            meta["self_awareness_note"] = f"High-intensity {name} - should be mindful of expression"
         elif intensity > 0.4:
             meta["feeling_about_feeling"] = "moderately feeling " + name
-            meta["self_awareness_note"] = "Noticeable " + name + " influencing behavior"
+            meta["self_awareness_note"] = f"Noticeable {name} influencing behavior"
         else:
             meta["feeling_about_feeling"] = "slightly feeling " + name
-            meta["self_awareness_note"] = "Mild " + name + " in the background"
+            meta["self_awareness_note"] = f"Mild {name} in the background"
     meta["last_reflection"] = now_iso()
     return state
 
@@ -625,23 +720,14 @@ def update_meta_emotion(state, derived):
 # Relationship Stage
 # ============================================================
 
-RELATIONSHIP_STAGES = ["stranger", "acquaintance", "familiar", "companion", "intimate"]
-
-# 4-dimensional continuous relationship vector
-RELATIONSHIP_DIMS = {
-    "closeness": (0, 1),      # 亲密度：互动频率和深度积累
-    "trust": (0, 1),          # 信任度：承诺兑现、隐私尊重
-    "understanding": (0, 1),  # 理解度：对彼此偏好/习惯的了解
-    "investment": (0, 1)      # 投入度：双方在关系中的情感投资
-}
+RELATIONSHIP_STAGES: List[str] = ["stranger", "acquaintance", "familiar", "companion", "intimate"]
 
 
-def derive_relationship_stage(rel_vector):
-    """从连续向量派生阶段标签"""
+def derive_relationship_stage(rel_vector: RelationshipVector) -> str:
+    """Derive stage label from continuous relationship vector."""
     avg = sum(rel_vector.values()) / len(rel_vector)
     min_val = min(rel_vector.values())
 
-    # 阶段要求所有维度都达到一定水平（不能偏科）
     if avg >= 0.8 and min_val >= 0.6:
         return "intimate"
     elif avg >= 0.6 and min_val >= 0.4:
@@ -654,14 +740,14 @@ def derive_relationship_stage(rel_vector):
         return "stranger"
 
 
-def update_relationship(state, trigger=None):
+def update_relationship(state: AffectiveState, trigger: Optional[str] = None) -> AffectiveState:
+    """Update relationship state based on current dimensions."""
     rel = state["relationship"]
     dims = state["core_state"]["dimensions"]
 
-    # 确保 rel_vector 存在（兼容旧状态）
+    # Ensure rel_vector exists (backward compatibility)
     if "rel_vector" not in rel:
-        # 从旧 stage_score 迁移
-        old_score = rel.get("stage_score", 0) / 100.0  # normalize to [0,1]
+        old_score = rel.get("stage_score", 0) / 100.0
         rel["rel_vector"] = {
             "closeness": min(1.0, old_score * 1.2),
             "trust": min(1.0, old_score * 0.8),
@@ -686,20 +772,15 @@ def update_relationship(state, trigger=None):
     if emotional_depth > 0.5:
         rv["investment"] = min(1.0, rv["investment"] + emotional_depth * 0.005)
 
-    # 负面事件可以降低维度（关系不是单调递增的！）
+    # 负面事件可以降低维度
     if dims["frustration"] > 0.5:
         rv["trust"] = max(0, rv["trust"] - 0.005)
     if dims["valence"] < -0.3:
         rv["investment"] = max(0, rv["investment"] - 0.002)
 
-    # 长时间不互动 → closeness 缓慢衰减
-    # （这个由 last_event_time 判断，在 decay 阶段处理）
-
-    # 更新 stage_score（保持向后兼容）
+    # 更新兼容字段
     avg = sum(rv.values()) / len(rv)
     rel["stage_score"] = round(avg * 100, 1)
-
-    # 更新 trust_accumulated（保持向后兼容）
     rel["trust_accumulated"] = round(rv["trust"] * 100, 1)
 
     # 派生阶段标签
@@ -719,9 +800,9 @@ def update_relationship(state, trigger=None):
 
     rel["stage"] = new_stage
     rel["rel_vector"] = rv
-    rel["interaction_days"] = rel.get("interaction_days", 0)  # 保持不变，由外部计算
+    rel["interaction_days"] = rel.get("interaction_days", 0)
 
-    state["relationship"] = rel
+    state["relationship"] = rel  # type: ignore
     return state
 
 
@@ -729,9 +810,11 @@ def update_relationship(state, trigger=None):
 # Consistency Check
 # ============================================================
 
-def consistency_check(state, old_dims, new_dims):
+def consistency_check(state: AffectiveState, old_dims: DimensionsDict, 
+                      new_dims: DimensionsDict) -> DimensionsDict:
+    """Check and enforce consistency limits on dimension changes."""
     con = state["consistency"]
-    clamped = {}
+    clamped: DimensionsDict = old_dims.copy()  # type: ignore
     violation = False
 
     for dim in DIMENSIONS:
@@ -761,11 +844,11 @@ def consistency_check(state, old_dims, new_dims):
 
 
 # ============================================================
-# History (with compression)
+# History (with optional compression)
 # ============================================================
 
-def compress_history(hist):
-    """Compress old history entries by aggregating batches into summary entries."""
+def compress_history(hist: History) -> History:
+    """Compress old history entries by aggregating batches."""
     recent = hist.get("recent_states", [])
     compressed = hist.get("compressed_states", [])
 
@@ -784,7 +867,7 @@ def compress_history(hist):
             continue
 
         # Average dimensions across the batch
-        avg_dims = {}
+        avg_dims: Dict[str, float] = {}
         for dim in DIMENSIONS:
             vals = [e["dimensions"].get(dim, 0) for e in batch if "dimensions" in e]
             if vals:
@@ -792,7 +875,7 @@ def compress_history(hist):
 
         # Collect dominant emotions
         emotions = [e.get("dominant_emotion", "neutral") for e in batch]
-        emotion_counts = {}
+        emotion_counts: Dict[str, int] = {}
         for em in emotions:
             emotion_counts[em] = emotion_counts.get(em, 0) + 1
         top_emotion = max(emotion_counts, key=emotion_counts.get) if emotion_counts else "neutral"
@@ -814,19 +897,16 @@ def compress_history(hist):
     return hist
 
 
-def append_history(state, trigger=None):
+def append_history(state: AffectiveState, trigger: Optional[str] = None) -> AffectiveState:
+    """Append current state to history."""
     hist = state["history"]
-    entry = {
+    entry: HistoryEntry = {
         "time": now_iso(),
-        "dimensions": {d: round(state["core_state"]["dimensions"][d], 4) for d in DIMENSIONS},
+        "dimensions": {d: round(state["core_state"]["dimensions"][d], 4) for d in DIMENSIONS},  # type: ignore
         "dominant_emotion": state["derived_emotions"].get("dominant", "neutral"),
         "trigger": trigger
     }
     hist["recent_states"].append(entry)
-
-    # Compress if exceeding threshold
-    if len(hist["recent_states"]) > HISTORY_COMPRESS_THRESHOLD:
-        hist = compress_history(hist)
 
     # Ensure compressed_states exists
     if "compressed_states" not in hist:
@@ -840,40 +920,73 @@ def append_history(state, trigger=None):
 # Subcommands
 # ============================================================
 
-def cmd_init(args):
+def cmd_init(args) -> None:
+    """Initialize state file with persona preset."""
+    skill_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     persona = args.persona if args.persona else "default"
-    state = create_initial_state(persona)
-    save_state(state, args.state_file)
-    print(json.dumps({"status": "initialized", "persona": persona, "file": args.state_file}, ensure_ascii=False))
+    state = create_initial_state(persona, skill_dir)
+    
+    try:
+        save_state(state, args.state_file)
+        print(json.dumps({"status": "initialized", "persona": persona, "file": args.state_file}, 
+                         ensure_ascii=False))
+    except StateIOError as e:
+        print(json.dumps({"error": str(e), "success": False}, ensure_ascii=False), file=sys.stderr)
+        sys.exit(1)
 
 
-def cmd_decay(args):
-    state = load_state(args.state_file)
-    state = apply_decay(state)
-    save_state(state, args.state_file)
-    print(json.dumps({
-        "status": "decay_applied",
-        "dimensions": {d: round(state["core_state"]["dimensions"][d], 4) for d in DIMENSIONS},
-        "circadian_phase": state["dynamics"]["circadian_phase"]
-    }, ensure_ascii=False))
+def cmd_decay(args) -> None:
+    """Apply time decay and endogenous fluctuation."""
+    try:
+        state = load_state(args.state_file)
+        
+        # 1. Apply decay and endogenous fluctuations
+        state = apply_decay(state)
+        
+        # 2. Perform background maintenance: compress history
+        if "history" in state:
+            state["history"] = compress_history(state["history"])
+            
+        save_state(state, args.state_file)
+        
+        print(json.dumps({
+            "status": "decay_applied",
+            "dimensions": {d: round(state["core_state"]["dimensions"][d], 4) for d in DIMENSIONS},
+            "circadian_phase": state["dynamics"]["circadian_phase"],
+            "history_compressed": len(state["history"].get("recent_states", [])) <= HISTORY_COMPRESS_THRESHOLD
+        }, ensure_ascii=False))
+    except StateIOError as e:
+        print(json.dumps({"error": str(e), "success": False}, ensure_ascii=False), file=sys.stderr)
+        sys.exit(1)
 
 
-def cmd_update(args):
-    state = load_state(args.state_file)
+def cmd_update(args) -> None:
+    """Event-driven state update."""
+    try:
+        state = load_state(args.state_file)
+    except StateIOError as e:
+        print(json.dumps({"error": str(e), "success": False}, ensure_ascii=False), file=sys.stderr)
+        sys.exit(1)
+
+    # Ensure runtime config is loaded
+    skill_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    persona_name = state["persona_baseline"].get("persona_name", "default")
+    load_runtime_config(skill_dir, persona_name)
 
     # Snapshot before
-    old_dims = {d: state["core_state"]["dimensions"][d] for d in DIMENSIONS}
+    old_dims = {d: state["core_state"]["dimensions"][d] for d in DIMENSIONS}  # type: ignore
 
     # Step 1: Apply decay
     state = apply_decay(state)
     dims = state["core_state"]["dimensions"]
 
     # Step 2: Apply event deltas with inertia smoothing
-    deltas = {}
+    inertia = get_inertia()
+    deltas: Dict[str, float] = {}
     for dim in DIMENSIONS:
         raw_delta = getattr(args, dim, 0.0) or 0.0
         if raw_delta != 0.0:
-            effective_delta = raw_delta * (1.0 - INERTIA[dim])
+            effective_delta = raw_delta * (1.0 - inertia[dim])
             dims[dim] += effective_delta
             deltas[dim] = round(effective_delta, 4)
 
@@ -881,23 +994,20 @@ def cmd_update(args):
     dims = apply_coupling(dims)
 
     # Step 3.5: Positive event auto-recovery
-    # If valence delta is positive, reduce negative dims automatically
     if deltas.get("valence", 0) > 0.1:
         positive_strength = deltas["valence"]
-        # Reduce frustration
         dims["frustration"] = max(0, dims["frustration"] - positive_strength * 0.3)
-        # Reduce fatigue slightly
         dims["fatigue"] = max(0, dims["fatigue"] - positive_strength * 0.1)
 
-    # Step 4: Clamp + safety boundaries
-    for dim in DIMENSIONS:
-        dims[dim] = clamp(dims[dim], dim)
+    # Step 4: Safety boundaries first (tighten ranges), then hard clamp
     dims = apply_safety_clamps(dims)
+    for dim in DIMENSIONS:
+        dims[dim] = clamp(dims[dim], dim, DIM_RANGES)
 
     # Step 5: Consistency check
     new_dims = consistency_check(state, old_dims, dims)
     for dim in DIMENSIONS:
-        dims[dim] = clamp(new_dims[dim], dim)
+        dims[dim] = clamp(new_dims[dim], dim, DIM_RANGES)
 
     state["core_state"]["dimensions"] = dims
     state["core_state"]["update_count"] += 1
@@ -916,13 +1026,17 @@ def cmd_update(args):
     # Step 8: Relationship
     state = update_relationship(state, trigger=args.trigger)
 
-    # Step 9: History
+    # Step 9: History (no compression on hot path)
     state = append_history(state, trigger=args.trigger)
 
-    save_state(state, args.state_file)
+    try:
+        save_state(state, args.state_file)
+    except StateIOError as e:
+        print(json.dumps({"error": str(e), "success": False}, ensure_ascii=False), file=sys.stderr)
+        sys.exit(1)
 
     # Output
-    changes = {}
+    changes: Dict[str, float] = {}
     for dim in DIMENSIONS:
         delta = dims[dim] - old_dims[dim]
         if abs(delta) > 0.001:
@@ -943,8 +1057,14 @@ def cmd_update(args):
     print(json.dumps(output, ensure_ascii=False, indent=2))
 
 
-def cmd_get(args):
-    state = load_state(args.state_file)
+def cmd_get(args) -> None:
+    """Get current state (read-only)."""
+    try:
+        state = load_state(args.state_file)
+    except StateIOError as e:
+        print(json.dumps({"error": str(e), "success": False}, ensure_ascii=False), file=sys.stderr)
+        sys.exit(1)
+    
     dims = state["core_state"]["dimensions"]
     rel = state["relationship"]
     output = {
@@ -961,8 +1081,14 @@ def cmd_get(args):
     print(json.dumps(output, ensure_ascii=False, indent=2))
 
 
-def cmd_analyze(args):
-    state = load_state(args.state_file)
+def cmd_analyze(args) -> None:
+    """Generate analysis report."""
+    try:
+        state = load_state(args.state_file)
+    except StateIOError as e:
+        print(json.dumps({"error": str(e), "success": False}, ensure_ascii=False), file=sys.stderr)
+        sys.exit(1)
+    
     dims = state["core_state"]["dimensions"]
 
     # Recompute derived
@@ -971,8 +1097,7 @@ def cmd_analyze(args):
     dominant_intensity = derived[0]["intensity"] if derived else 0.0
 
     # Mood description
-    v = dims["valence"]
-    a = dims["arousal"]
+    v, a = dims["valence"], dims["arousal"]
     if v > 0.3 and a > 0.2:
         mood = "upbeat and energized"
     elif v > 0.2 and a < 0.1:
@@ -1044,7 +1169,8 @@ def cmd_analyze(args):
         "suggested_tone": suggested_tone,
         "engagement_readiness": round(engagement, 4),
         "trend": trend,
-        "active_emotions": [{"emotion": e["emotion"], "intensity": e["intensity"]} for e in derived if e["intensity"] > 0.15],
+        "active_emotions": [{"emotion": e["emotion"], "intensity": e["intensity"]} 
+                           for e in derived if e["intensity"] > 0.15],
         "dimensions_summary": {d: round(dims[d], 4) for d in DIMENSIONS},
         "relationship_stage": state["relationship"]["stage"],
         "rel_vector": state["relationship"].get("rel_vector", {})
@@ -1052,8 +1178,76 @@ def cmd_analyze(args):
     print(json.dumps(output, ensure_ascii=False, indent=2))
 
 
-def cmd_history(args):
-    state = load_state(args.state_file)
+def cmd_evaluate(args) -> None:
+    """Evaluate text event to suggest dimension deltas (rule-based NLP fallback)."""
+    text = args.text.lower()
+    deltas: Dict[str, float] = {d: 0.0 for d in DIMENSIONS}
+    reasoning: List[str] = []
+
+    # Simple heuristic rule engine for text classification to dimension deltas
+    # (Agent should ideally pass direct JSON deltas, this is a fallback/helper)
+    rules = [
+        # Positive / Validation
+        (["好", "棒", "不错", "喜欢", "赞", "谢谢", "good", "great", "thanks", "love"], 
+         {"valence": 0.2, "confidence": 0.1, "affiliation": 0.1}, "positive feedback"),
+        
+        # Negative / Criticism
+        (["差", "错", "不对", "讨厌", "糟", "bad", "wrong", "terrible", "hate"], 
+         {"valence": -0.2, "frustration": 0.2, "confidence": -0.1}, "negative feedback"),
+        
+        # Interesting / Novel
+        (["有趣", "新奇", "好玩", "什么", "为什么", "interesting", "why", "curious"], 
+         {"curiosity": 0.3, "arousal": 0.2}, "novel stimuli"),
+         
+        # Boring / Repetitive
+        (["无聊", "重复", "又来", "乏味", "boring", "again", "tedious"], 
+         {"curiosity": -0.2, "fatigue": 0.1, "arousal": -0.2}, "repetitive task"),
+         
+        # Achievement / Task completion
+        (["完成", "搞定", "解决", "做好了", "done", "fixed", "completed", "solved"], 
+         {"fulfillment": 0.3, "confidence": 0.2, "valence": 0.2}, "task completion"),
+         
+        # Caring / Personal
+        (["早", "晚安", "休息", "累吗", "辛苦", "morning", "night", "rest", "tired"], 
+         {"affiliation": 0.2, "care": 0.2, "valence": 0.1}, "caring interaction")
+    ]
+
+    for keywords, effect, reason in rules:
+        if any(kw in text for kw in keywords):
+            reasoning.append(reason)
+            for dim, val in effect.items():
+                deltas[dim] = round(deltas.get(dim, 0) + val, 4)
+
+    # If no rules match, return minimal engagement
+    if not reasoning:
+        deltas["arousal"] = 0.05
+        reasoning.append("neutral engagement")
+
+    # Clamp deltas to MAX_DELTA_PER_STEP
+    for dim, val in deltas.items():
+        if val != 0:
+            deltas[dim] = max(-MAX_DELTA_PER_STEP, min(MAX_DELTA_PER_STEP, val))
+
+    # Filter zero deltas
+    filtered_deltas = {k: v for k, v in deltas.items() if abs(v) > 0.001}
+
+    output = {
+        "event": args.text,
+        "suggested_deltas": filtered_deltas,
+        "reasoning": reasoning,
+        "usage_hint": "Use these deltas in the 'update' command."
+    }
+    print(json.dumps(output, ensure_ascii=False, indent=2))
+
+
+def cmd_history(args) -> None:
+    """View state history."""
+    try:
+        state = load_state(args.state_file)
+    except StateIOError as e:
+        print(json.dumps({"error": str(e), "success": False}, ensure_ascii=False), file=sys.stderr)
+        sys.exit(1)
+    
     hist = state["history"].get("recent_states", [])
     compressed = state["history"].get("compressed_states", [])
     limit = args.limit if args.limit else 10
@@ -1067,8 +1261,14 @@ def cmd_history(args):
     print(json.dumps(output, ensure_ascii=False, indent=2))
 
 
-def cmd_reset(args):
-    state = load_state(args.state_file)
+def cmd_reset(args) -> None:
+    """Reset to baseline (keeps history and relationship)."""
+    try:
+        state = load_state(args.state_file)
+    except StateIOError as e:
+        print(json.dumps({"error": str(e), "success": False}, ensure_ascii=False), file=sys.stderr)
+        sys.exit(1)
+    
     baseline = state["persona_baseline"]["dimensions"]
     for dim in DIMENSIONS:
         state["core_state"]["dimensions"][dim] = baseline[dim]
@@ -1077,20 +1277,28 @@ def cmd_reset(args):
     state["meta_emotion"] = {"feeling_about_feeling": None, "self_awareness_note": None, "last_reflection": None}
     state["dynamics"]["last_event_time"] = None
     state["dynamics"]["consecutive_similar_events"] = 0
-    # Keep history and relationship intact
-    save_state(state, args.state_file)
-    print(json.dumps({"status": "reset", "dimensions": {d: round(baseline[d], 4) for d in DIMENSIONS}}, ensure_ascii=False))
+
+    try:
+        save_state(state, args.state_file)
+    except StateIOError as e:
+        print(json.dumps({"error": str(e), "success": False}, ensure_ascii=False), file=sys.stderr)
+        sys.exit(1)
+    
+    print(json.dumps({"status": "reset", "dimensions": {d: round(baseline[d], 4) for d in DIMENSIONS}}, 
+                     ensure_ascii=False))
 
 
-def cmd_validate(args):
-    errors = []
-    warnings = []
+def cmd_validate(args) -> None:
+    """Validate state file integrity."""
+    errors: List[str] = []
+    warnings: List[str] = []
     checks_passed = 0
 
     try:
         state = load_state(args.state_file)
-    except Exception as e:
-        print(json.dumps({"valid": False, "checks_passed": 0, "errors": [f"cannot load state file: {e}"], "warnings": []}, ensure_ascii=False))
+    except StateIOError as e:
+        print(json.dumps({"valid": False, "checks_passed": 0, "errors": [str(e)], "warnings": []}, 
+                         ensure_ascii=False))
         return
 
     # Check 1: schema_version == 2
@@ -1180,7 +1388,7 @@ def cmd_validate(args):
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Emotional Persona Engine - Core State Engine")
+    parser = argparse.ArgumentParser(description="Emotional Persona Engine - Core State Engine (v2.0)")
     parser.add_argument("--state-file", required=True, help="Path to affective-state.json")
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
@@ -1204,6 +1412,10 @@ def main():
     # analyze
     subparsers.add_parser("analyze", help="Generate analysis report")
 
+    # evaluate
+    p_eval = subparsers.add_parser("evaluate", help="Evaluate text event to suggest dimension deltas")
+    p_eval.add_argument("--text", type=str, required=True, help="Text event description")
+
     # history
     p_hist = subparsers.add_parser("history", help="View state history")
     p_hist.add_argument("--limit", type=int, default=10, help="Number of entries to show")
@@ -1226,6 +1438,8 @@ def main():
         cmd_get(args)
     elif args.command == "analyze":
         cmd_analyze(args)
+    elif args.command == "evaluate":
+        cmd_evaluate(args)
     elif args.command == "history":
         cmd_history(args)
     elif args.command == "reset":
